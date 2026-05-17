@@ -25,7 +25,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   fail "python3 missing"
 fi
 
-read -r declared_type cache_dir script_name image_url qcow2_name < <(python3 - "${cfg}" "${sensor}" <<'PY'
+read -r declared_type sensor_version cache_dir script_name image_url qcow2_name < <(python3 - "${cfg}" "${sensor}" <<'PY'
 import json, sys
 path, sensor = sys.argv[1:3]
 with open(path, encoding="utf-8") as fh:
@@ -33,6 +33,7 @@ with open(path, encoding="utf-8") as fh:
 vm = (cfg.get("vms") or {}).get(sensor) or {}
 print(
     vm.get("type", ""),
+    vm.get("sensor_version", ""),
     vm.get("sensor_cache_dir", ""),
     vm.get("virt_deploy_script_name", ""),
     vm.get("image_url", ""),
@@ -56,13 +57,23 @@ fi
 script_ok=0
 image_ok=0
 [[ -n "${script_name}" && -x "${script_path}" ]] && script_ok=1
-[[ -f "${image_path}" ]] && image_ok=1
+if [[ -f "${image_path}" ]]; then
+  if python3 - "${image_path}" <<'PY' >/dev/null 2>&1
+import sys
+with open(sys.argv[1], "rb") as fh:
+    sys.exit(0 if fh.read(4) == b"QFI\xfb" else 1)
+PY
+  then
+    image_ok=1
+  fi
+fi
 
 stellar_sensor_artifact_found=false
 if [[ "${script_ok}" -eq 1 && "${image_ok}" -eq 1 ]]; then
   stellar_sensor_artifact_found=true
 fi
 stellar_sensor_ready="${stellar_sensor_artifact_found}"
+ready_for_stellar_sensor_scenario="${stellar_sensor_ready}"
 
 runtime_looks_generic=0
 if command -v virsh >/dev/null 2>&1 && virsh dominfo "${sensor}" >/dev/null 2>&1; then
@@ -76,8 +87,23 @@ else
 fi
 
 sensor_type="stellar_sensor"
+if [[ "${declared_type}" != "sensor" || "${runtime_looks_generic}" -eq 1 ]]; then
+  stellar_sensor_ready=false
+fi
+if [[ -n "${state}" && "${state}" != "running" ]]; then
+  stellar_sensor_ready=false
+fi
+ready_for_stellar_sensor_scenario="${stellar_sensor_ready}"
 
-detail="sensor_type=${sensor_type} stellar_sensor_artifact_found=${stellar_sensor_artifact_found} stellar_sensor_ready=${stellar_sensor_ready}"
+cat <<EOF
+sensor_type=${sensor_type}
+sensor_version=${sensor_version:-unknown}
+stellar_sensor_artifact_found=${stellar_sensor_artifact_found}
+stellar_sensor_ready=${stellar_sensor_ready}
+READY_FOR_STELLAR_SENSOR_SCENARIO=${ready_for_stellar_sensor_scenario}
+EOF
+
+detail="sensor_type=${sensor_type} sensor_version=${sensor_version:-unknown} stellar_sensor_artifact_found=${stellar_sensor_artifact_found} stellar_sensor_ready=${stellar_sensor_ready} READY_FOR_STELLAR_SENSOR_SCENARIO=${ready_for_stellar_sensor_scenario}"
 
 if [[ "${declared_type}" != "sensor" ]]; then
   fail "${detail} sensor-vm declared type must be sensor, got ${declared_type:-missing}"

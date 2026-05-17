@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -65,6 +66,63 @@ def is_placeholder_url(url: str) -> bool:
         or "replace_me" in lowered
         or "placeholder" in lowered
     )
+
+
+def is_stellar_sensor_image(image: dict[str, Any]) -> bool:
+    url = str(image.get("url", "")).lower()
+    name = str(image.get("name", "")).lower()
+    return (
+        image.get("vm_role") == "sensor-vm"
+        or "stellarcyber.ai" in url
+        or "modular_ds" in name
+        or "modular-ds" in name
+    )
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in ("STELLAR_DOWNLOAD_USER", "STELLAR_DOWNLOAD_PASSWORD"):
+            continue
+        try:
+            parsed = shlex.split(value, posix=True)
+            values[key] = parsed[0] if parsed else ""
+        except ValueError:
+            values[key] = value.strip().strip("'\"")
+    return values
+
+
+def stellar_credentials(env_file: Path, *, log_path: Path | None) -> tuple[str, str]:
+    file_values = load_env_file(env_file)
+    user = os.environ.get("STELLAR_DOWNLOAD_USER") or file_values.get("STELLAR_DOWNLOAD_USER", "")
+    password = os.environ.get("STELLAR_DOWNLOAD_PASSWORD") or file_values.get(
+        "STELLAR_DOWNLOAD_PASSWORD", ""
+    )
+    if env_file.is_file():
+        try:
+            if env_file.stat().st_mode & 0o077:
+                log_jsonl(
+                    log_path,
+                    "stellar_download_env_permissions_warning",
+                    path=str(env_file),
+                    recommendation="chmod 600",
+                )
+        except OSError:
+            pass
+    if not user or not password:
+        raise RuntimeError(
+            "Stellar download credentials missing. Set STELLAR_DOWNLOAD_USER and "
+            "STELLAR_DOWNLOAD_PASSWORD in the environment or in "
+            f"{env_file} (chmod 600 recommended)."
+        )
+    return user, password
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
@@ -139,6 +197,7 @@ def download_url(
     *,
     log_path: Path | None,
     dry_run: bool,
+    credentials: tuple[str, str] | None = None,
 ) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.parent / (dest.name + ".part")
@@ -155,6 +214,9 @@ def download_url(
             dry_run=True,
         )
         return
+    user = password = ""
+    if credentials:
+        user, password = credentials
     if aria:
         log_jsonl(log_path, "image_download_started", url=url, dest=str(dest), tool="aria2c")
         cmd = [
@@ -168,8 +230,10 @@ def download_url(
             str(partial.parent),
             "-o",
             partial.name,
-            url,
         ]
+        if credentials:
+            cmd.extend(["--http-user", user, "--http-passwd", password])
+        cmd.append(url)
         r = subprocess.run(cmd, check=False)
         if r.returncode != 0:
             log_jsonl(
@@ -186,7 +250,10 @@ def download_url(
         return
     if curl:
         log_jsonl(log_path, "image_download_started", url=url, dest=str(dest), tool="curl")
-        cmd = ["curl", "-fL", "-C", "-", "--retry", "3", "--retry-delay", "2", "-o", str(dest), url]
+        cmd = ["curl", "-fL", "-C", "-", "--retry", "3", "--retry-delay", "2"]
+        if credentials:
+            cmd.extend(["--user", f"{user}:{password}"])
+        cmd.extend(["-o", str(dest), url])
         r = subprocess.run(cmd, check=False)
         if r.returncode != 0:
             log_jsonl(
@@ -277,6 +344,77 @@ def run_zstd_decompress(zst: Path, out: Path, *, log_path: Path | None, dry_run:
     log_jsonl(log_path, "image_decompress_success", image=image_name, dst=str(out))
 
 
+def infer_artifact_type(image: dict[str, Any], path: Path) -> str:
+    explicit = str(image.get("artifact_type", "") or image.get("type", "")).strip().lower()
+    if explicit:
+        return explicit
+    if bool(image.get("chmod_executable")) or path.name.endswith(".sh"):
+        return "shell-script"
+    if path.name.endswith(".qcow2"):
+        return "qcow2"
+    return ""
+
+
+def verify_artifact_type(
+    path: Path,
+    artifact_type: str,
+    *,
+    log_path: Path | None,
+    dry_run: bool,
+    image_name: str,
+) -> bool:
+    if not artifact_type:
+        return True
+    if dry_run:
+        log_jsonl(
+            log_path,
+            "image_artifact_type_verified",
+            image=image_name,
+            path=str(path),
+            artifact_type=artifact_type,
+            dry_run=True,
+        )
+        return True
+    if artifact_type in ("shell-script", "shell", "script"):
+        if not path.is_file():
+            print(f"ERROR: {image_name}: shell script missing: {path}", file=sys.stderr)
+            return False
+        try:
+            first = path.read_bytes()[:256]
+        except OSError as exc:
+            print(f"ERROR: {image_name}: unable to read shell script {path}: {exc}", file=sys.stderr)
+            return False
+        if not os.access(path, os.X_OK):
+            print(f"ERROR: {image_name}: shell script is not executable: {path}", file=sys.stderr)
+            return False
+        first_line = first.splitlines()[0].lower() if first.splitlines() else b""
+        if not first.startswith(b"#!") or b"sh" not in first_line:
+            print(f"ERROR: {image_name}: artifact is not an executable shell script: {path}", file=sys.stderr)
+            return False
+    elif artifact_type == "qcow2":
+        if not path.is_file():
+            print(f"ERROR: {image_name}: qcow2 image missing: {path}", file=sys.stderr)
+            return False
+        try:
+            magic = path.read_bytes()[:4]
+        except OSError as exc:
+            print(f"ERROR: {image_name}: unable to read qcow2 image {path}: {exc}", file=sys.stderr)
+            return False
+        if magic != b"QFI\xfb":
+            print(f"ERROR: {image_name}: artifact is not a QEMU QCOW2 image: {path}", file=sys.stderr)
+            return False
+    else:
+        raise RuntimeError(f"unsupported artifact_type for {image_name}: {artifact_type}")
+    log_jsonl(
+        log_path,
+        "image_artifact_type_verified",
+        image=image_name,
+        path=str(path),
+        artifact_type=artifact_type,
+    )
+    return True
+
+
 def cmd_download(args: argparse.Namespace) -> int:
     manifest = Path(args.manifest)
     state_path = Path(args.state)
@@ -284,6 +422,7 @@ def cmd_download(args: argparse.Namespace) -> int:
     log_path = Path(args.log_file) if args.log_file else None
     dry_run = bool(args.dry_run)
     force = bool(args.force) or os.environ.get("XDR_LAB_IMAGE_DOWNLOAD_FORCE") == "1"
+    stellar_env = Path(os.environ.get("XDR_LAB_STELLAR_DOWNLOAD_ENV") or args.stellar_env)
 
     data = load_manifest(manifest)
     images: list[dict[str, Any]] = [i for i in data["images"] if isinstance(i, dict)]
@@ -292,6 +431,8 @@ def cmd_download(args: argparse.Namespace) -> int:
 
     select = args.select or "MANIFEST_ALL"
     selected = list(iter_selected(images, select))
+    if args.version:
+        selected = [im for im in selected if str(im.get("version", "")) == str(args.version)]
     if not selected:
         msg = f"no manifest images matched select={select!r}"
         if dry_run:
@@ -314,6 +455,16 @@ def cmd_download(args: argparse.Namespace) -> int:
         log_jsonl(log_path, "image_download_failed", reason=msg)
         print(f"ERROR: {msg}", file=sys.stderr)
         return 2
+
+    sensor_selected = [im for im in selected if is_stellar_sensor_image(im)]
+    sensor_credentials: tuple[str, str] | None = None
+    if sensor_selected and not dry_run:
+        try:
+            sensor_credentials = stellar_credentials(stellar_env, log_path=log_path)
+        except RuntimeError as exc:
+            log_jsonl(log_path, "image_download_failed", reason="stellar_credentials_missing")
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
 
     if dry_run:
         print("DRY-RUN image download plan:", file=sys.stdout)
@@ -339,8 +490,8 @@ def cmd_download(args: argparse.Namespace) -> int:
         ctype = (im.get("compression") or im.get("compression_type") or "").strip()
         keep_zst = bool(im.get("keep_compressed_artifact", im.get("keep_zst", True)))
 
-        if not name or not url or not sha:
-            msg = f"manifest entry incomplete: name={name!r} url set={bool(url)} sha set={bool(sha)}"
+        if not name or not url:
+            msg = f"manifest entry incomplete: name={name!r} url set={bool(url)}"
             if required:
                 log_jsonl(log_path, "image_download_failed", image=name or "?", reason=msg)
                 print(f"ERROR: {msg}", file=sys.stderr)
@@ -392,12 +543,12 @@ def cmd_download(args: argparse.Namespace) -> int:
             meta_ok = (
                 prev.get("version") == version
                 and prev.get("verified") is True
-                and str(prev.get("sha256", "")).lower() == sha.lower()
+                and (not sha or str(prev.get("sha256", "")).lower() == sha.lower())
             )
             if meta_ok and out_path.is_file():
                 if compressed:
                     if keep_zst and dl_path.is_file():
-                        if verify_checksum(dl_path, sha, log_path=log_path, dry_run=False, image_name=name):
+                        if not sha or verify_checksum(dl_path, sha, log_path=log_path, dry_run=False, image_name=name):
                             log_jsonl(
                                 log_path,
                                 "image_cache_hit",
@@ -426,7 +577,7 @@ def cmd_download(args: argparse.Namespace) -> int:
                         )
                         continue
                 else:
-                    if verify_checksum(out_path, sha, log_path=log_path, dry_run=False, image_name=name):
+                    if not sha or verify_checksum(out_path, sha, log_path=log_path, dry_run=False, image_name=name):
                         log_jsonl(
                             log_path,
                             "image_cache_hit",
@@ -444,7 +595,7 @@ def cmd_download(args: argparse.Namespace) -> int:
         try:
             need_dl = force or not dl_path.is_file()
             if not need_dl and compressed:
-                if not verify_checksum(dl_path, sha, log_path=log_path, dry_run=False, image_name=name):
+                if sha and not verify_checksum(dl_path, sha, log_path=log_path, dry_run=False, image_name=name):
                     if required:
                         try:
                             dl_path.unlink()
@@ -455,7 +606,7 @@ def cmd_download(args: argparse.Namespace) -> int:
                         log_jsonl(log_path, "image_download_failed", image=name, reason="checksum", skipped_optional=True)
                         continue
             if not need_dl and not compressed:
-                if not verify_checksum(out_path, sha, log_path=log_path, dry_run=False, image_name=name):
+                if sha and not verify_checksum(out_path, sha, log_path=log_path, dry_run=False, image_name=name):
                     if required:
                         try:
                             out_path.unlink()
@@ -467,7 +618,13 @@ def cmd_download(args: argparse.Namespace) -> int:
                         continue
 
             if need_dl:
-                download_url(url, dl_path, log_path=log_path, dry_run=dry_run)
+                download_url(
+                    url,
+                    dl_path,
+                    log_path=log_path,
+                    dry_run=dry_run,
+                    credentials=sensor_credentials if is_stellar_sensor_image(im) else None,
+                )
                 if isinstance(size_b, int) and size_b > 0 and dl_path.is_file():
                     act = dl_path.stat().st_size
                     if act != size_b:
@@ -486,7 +643,7 @@ def cmd_download(args: argparse.Namespace) -> int:
                                 pass
                             return 2
 
-            if not verify_checksum(dl_path, sha, log_path=log_path, dry_run=dry_run, image_name=name):
+            if sha and not verify_checksum(dl_path, sha, log_path=log_path, dry_run=dry_run, image_name=name):
                 if required:
                     return 2
                 log_jsonl(log_path, "image_download_failed", image=name, reason="checksum", skipped_optional=True)
@@ -503,17 +660,29 @@ def cmd_download(args: argparse.Namespace) -> int:
                         dl_path.unlink()
                     except OSError:
                         pass
-            write_state(
-                downloaded=True,
-                verified=True,
-                size_bytes=out_path.stat().st_size if out_path.is_file() else None,
-            )
             if im.get("chmod_executable") or str(out_path).endswith(".sh"):
                 try:
                     mode = out_path.stat().st_mode
                     out_path.chmod(mode | 0o111)
                 except OSError:
                     pass
+            artifact_type = infer_artifact_type(im, out_path)
+            if not verify_artifact_type(
+                out_path,
+                artifact_type,
+                log_path=log_path,
+                dry_run=dry_run,
+                image_name=name,
+            ):
+                if required:
+                    return 2
+                log_jsonl(log_path, "image_download_failed", image=name, reason="artifact_type", skipped_optional=True)
+                continue
+            write_state(
+                downloaded=True,
+                verified=True,
+                size_bytes=out_path.stat().st_size if out_path.is_file() else None,
+            )
         except Exception as e:
             if required:
                 log_jsonl(log_path, "image_download_failed", image=name, reason=str(e))
@@ -562,10 +731,12 @@ def main() -> int:
     ap.add_argument("--xdr-root", required=True)
     ap.add_argument("--log-file", default="")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--stellar-env", default="/etc/xdr-lab/stellar-download.env")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("download", help="Download / verify / decompress per manifest")
     sp.add_argument("--select", default="", help="MANIFEST_ALL | vm_role | image name")
+    sp.add_argument("--version", default="", help="Optional artifact version filter")
     sp.add_argument("--force", action="store_true")
     sp.set_defaults(func=cmd_download)
 

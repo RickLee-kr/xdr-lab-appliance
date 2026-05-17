@@ -111,6 +111,11 @@ CALDERA runtime:
   caldera wait-ready [--dry-run]
   agent deploy|verify [--json] [--dry-run]   (Sandcat helpers)
 
+Stellar Modular Data Sensor:
+  sensor download --version VERSION [--force] [--dry-run]
+  sensor deploy --version VERSION [--cpus N] [--memory-mb N] [--disk-gb N] [--dry-run]
+  sensor verify [--dry-run]
+
 Windows browser / VNC console hints:
   web-console start [vm] [--dry-run]   (default vm: windows-victim)
   web-console stop [vm] [--dry-run]
@@ -410,6 +415,25 @@ def _lab_invoke_script_caldera_dry(argv_tail: Sequence[str], *, dry_run: bool) -
     return rc
 
 
+def _lab_invoke_script_engine_dry(argv_tail: Sequence[str], *, dry_run: bool) -> int:
+    """Run vm-manager with XDR_LAB_DRY_RUN=1 so engine-level dry-run plans are rendered."""
+    argv = _lab_script_argv(argv_tail)
+    line = " ".join(shlex.quote(x) for x in argv)
+    if dry_run:
+        sys.stdout.write(f"DRY-RUN (engine mutations disabled): {line}\n")
+        sys.stdout.flush()
+    _require_lab_manager(dry_run=False)
+    env = os.environ.copy()
+    if dry_run:
+        env["XDR_LAB_DRY_RUN"] = "1"
+    else:
+        env.pop("XDR_LAB_DRY_RUN", None)
+    rc, out, err = shell_cmd_exec(argv, env=env)
+    rc = _emit_streams(rc, out, err)
+    _lab_failure_notice(argv, rc, err)
+    return rc
+
+
 def _lab_invoke_manager(
     action: str,
     target: str,
@@ -521,6 +545,76 @@ def lab_images_callback(argv: List[str], *, dry_run: bool) -> int:
         print(f"Unexpected arguments: {' '.join(tokens[1:])}", file=sys.stderr)
         return 2
     return _lab_invoke_script(["images", "status"], dry_run=dry_run)
+
+
+def _parse_required_value(tokens: List[str], flag: str) -> Tuple[Optional[str], List[str]]:
+    if flag not in tokens:
+        return None, tokens
+    idx = tokens.index(flag)
+    if idx + 1 >= len(tokens):
+        print(f"{flag} requires a value", file=sys.stderr)
+        raise SystemExit(2)
+    value = tokens[idx + 1]
+    rest = tokens[:idx] + tokens[idx + 2 :]
+    return value, rest
+
+
+@log_command
+def lab_sensor_callback(argv: List[str], *, dry_run: bool) -> int:
+    tokens, seen = _strip_flags(list(argv), ("--dry-run", "--force"))
+    dry_run = dry_run or seen["--dry-run"]
+    if not tokens or tokens[0] not in ("download", "deploy", "verify"):
+        print(
+            "Usage: aella_cli lab sensor download --version VERSION [--force] [--dry-run]\n"
+            "       aella_cli lab sensor deploy --version VERSION "
+            "[--cpus N] [--memory-mb N] [--disk-gb N] [--dry-run]\n"
+            "       aella_cli lab sensor verify [--dry-run]",
+            file=sys.stderr,
+        )
+        return 2
+    sub = tokens[0]
+    rest = tokens[1:]
+    tail: List[str] = ["sensor", sub]
+    if sub in ("download", "deploy"):
+        try:
+            version, rest = _parse_required_value(rest, "--version")
+        except SystemExit as exc:
+            return int(exc.code or 2)
+        if not version:
+            print(f"lab sensor {sub} requires --version VERSION", file=sys.stderr)
+            return 2
+        tail.extend(["--version", version])
+        if sub == "download":
+            if seen["--force"]:
+                tail.append("--force")
+            if rest:
+                print(f"Unexpected arguments: {' '.join(rest)}", file=sys.stderr)
+                return 2
+            return _lab_invoke_script_engine_dry(tail, dry_run=dry_run)
+        i = 0
+        while i < len(rest):
+            flag = rest[i]
+            if flag not in ("--cpus", "--memory-mb", "--disk-gb"):
+                print(f"Unexpected argument: {flag!r}", file=sys.stderr)
+                return 2
+            if i + 1 >= len(rest):
+                print(f"{flag} requires a value", file=sys.stderr)
+                return 2
+            value = rest[i + 1]
+            minimum = {"--cpus": 4, "--memory-mb": 6144, "--disk-gb": 80}[flag]
+            if not value.isdigit() or int(value) < minimum:
+                print(f"{flag} must be an integer >= {minimum}", file=sys.stderr)
+                return 2
+            tail.extend([flag, value])
+            i += 2
+        return _lab_invoke_script_engine_dry(tail, dry_run=dry_run)
+    if seen["--force"]:
+        print("--force is only supported for lab sensor download", file=sys.stderr)
+        return 2
+    if rest:
+        print(f"Unexpected arguments: {' '.join(rest)}", file=sys.stderr)
+        return 2
+    return _lab_invoke_script(tail, dry_run=dry_run)
 
 
 @log_command
@@ -1117,6 +1211,7 @@ def do_lab(argv: List[str]) -> int:
         "runtime": lab_runtime_callback,
         "images": lab_images_callback,
         "caldera": lab_caldera_callback,
+        "sensor": lab_sensor_callback,
         "vm": lab_vm_callback,
         "agent": lab_agent_callback,
         "debug": lab_debug_callback,
