@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validate OVS mirror telemetry path (br0 → sensor VM tap).
+# Validate OVS mirror telemetry path (br0 → sensor VM dedicated capture tap).
 # Read-only — does not mutate host state.
 #
 # Usage:
@@ -134,22 +134,28 @@ else
   rv_probe_end sensor_vm_running 0
 fi
 
-# sensor vnet resolved
+# sensor management/capture vnets resolved
 rv_probe_begin sensor_vnet
 sensor_vnet_ok=0
-sensor_vnet_detail="sensor vnet not resolved on ${LAB_BRIDGE}"
-sensor_iface=""
+sensor_vnet_detail="sensor management/capture vnets not resolved on ${LAB_BRIDGE}"
+sensor_mgmt_iface=""
+sensor_capture_iface=""
 sensor_vnet_out=""
 sensor_vnet_rc=0
 if [[ "${sensor_run_ok}" -eq 1 ]]; then
   set +e
-  sensor_vnet_out="$(rv_sensor_vnet_on_bridge "${SENSOR_VM}" "${LAB_BRIDGE}" 2>&1)"
+  sensor_vnet_out="$(rv_sensor_vnets_on_bridge "${SENSOR_VM}" "${LAB_BRIDGE}" 2>&1)"
   sensor_vnet_rc=$?
   set -e
   if [[ "${sensor_vnet_rc}" -eq 0 && -n "${sensor_vnet_out}" ]]; then
-    sensor_iface="${sensor_vnet_out}"
-    sensor_vnet_ok=1
-    sensor_vnet_detail="sensor iface=${sensor_iface} on ${LAB_BRIDGE}"
+    sensor_mgmt_iface="$(printf '%s\n' "${sensor_vnet_out}" | awk 'NF {print; exit}')"
+    sensor_capture_iface="$(printf '%s\n' "${sensor_vnet_out}" | awk 'NF {n++; if (n == 2) {print; exit}}')"
+    if [[ -n "${sensor_capture_iface}" ]]; then
+      sensor_vnet_ok=1
+      sensor_vnet_detail="sensor_mgmt_interface=${sensor_mgmt_iface} sensor_capture_interface=${sensor_capture_iface} on ${LAB_BRIDGE}"
+    else
+      sensor_vnet_detail="dedicated capture interface missing; single-NIC mirror reuse is unsupported"
+    fi
   elif rv_text_is_virsh_permission_denied "${sensor_vnet_out}" \
       || rv_text_is_ovs_permission_denied "${sensor_vnet_out}"; then
     sensor_vnet_detail="requires root privileges (virsh / ovs-vsctl)"
@@ -160,7 +166,7 @@ if [[ "${sensor_run_ok}" -eq 1 ]]; then
   elif [[ -n "${sensor_vnet_out}" ]]; then
     sensor_vnet_detail="${sensor_vnet_out}"
   else
-    sensor_vnet_detail="No libvirt vnet interface found for ${SENSOR_VM}"
+    sensor_vnet_detail="No libvirt management/capture vnet interfaces found for ${SENSOR_VM}"
   fi
   if [[ "${sensor_vnet_ok}" -ne -1 ]]; then
     rv_probe_end sensor_vnet "${sensor_vnet_ok}"
@@ -270,15 +276,17 @@ else
 
     if [[ "${mirror_ok}" -eq 1 ]]; then
       output_name="$(rv_ovs_mirror_output_port_name "${mirror_uuid}" || true)"
-      if [[ -n "${output_name}" && -n "${sensor_iface}" && "${output_name}" == "${sensor_iface}" ]]; then
+      if [[ -n "${output_name}" && -n "${sensor_capture_iface}" && "${output_name}" == "${sensor_capture_iface}" ]]; then
         output_ok=1
-        output_detail="output-port=${output_name}"
-      elif [[ -z "${sensor_iface}" ]]; then
-        output_detail="cannot verify output-port — sensor vnet unknown"
+        output_detail="mirror_output_port=${output_name} mirror_bound_to_capture_interface=true"
+      elif [[ -n "${output_name}" && -n "${sensor_mgmt_iface}" && "${output_name}" == "${sensor_mgmt_iface}" ]]; then
+        output_detail="mirror_output_port=${output_name} mirror_bound_to_capture_interface=false management NIC MUST NOT be mirror output"
+      elif [[ -z "${sensor_capture_iface}" ]]; then
+        output_detail="cannot verify output-port — sensor capture vnet unknown"
       elif [[ -z "${output_name}" ]]; then
         output_detail="mirror output-port unresolved"
       else
-        output_detail="output-port=${output_name:-unknown} expected ${sensor_iface}"
+        output_detail="mirror_output_port=${output_name:-unknown} expected_capture_interface=${sensor_capture_iface}"
       fi
       rv_probe_end mirror_output_port "${output_ok}"
       record mirror_output_port "${output_ok}" "${output_detail}" 41
@@ -311,11 +319,12 @@ else
 fi
 
 if [[ "${JSON_MODE}" -eq 1 ]]; then
-  python3 - "${OVERALL_RC}" "${LAB_BRIDGE}" "${SENSOR_VM}" "${XDR_LAB_MIRROR_NAME}" <<'PY' "${RESULTS[@]}"
+  python3 - "${OVERALL_RC}" "${LAB_BRIDGE}" "${SENSOR_VM}" "${XDR_LAB_MIRROR_NAME}" "${sensor_mgmt_iface}" "${sensor_capture_iface}" "${output_name}" <<'PY' "${RESULTS[@]}"
 import json, sys
 rc = int(sys.argv[1])
 bridge, sensor_vm, mirror_name = sys.argv[2], sys.argv[3], sys.argv[4]
-rows = sys.argv[5:]
+mgmt_iface, capture_iface, output_name = sys.argv[5], sys.argv[6], sys.argv[7]
+rows = sys.argv[8:]
 checks = []
 for row in rows:
     status, cid, detail = row.split("\t", 2)
@@ -332,11 +341,23 @@ print(json.dumps({
     "bridge": bridge,
     "sensor_vm": sensor_vm,
     "mirror_name": mirror_name,
+    "sensor_mgmt_interface": mgmt_iface or None,
+    "sensor_capture_interface": capture_iface or None,
+    "mirror_output_port": output_name or None,
+    "mirror_bound_to_capture_interface": bool(capture_iface and output_name == capture_iface),
     "checks": checks,
 }, indent=2, sort_keys=True))
 PY
 else
   echo "=== validate-ovs-mirror (${LAB_BRIDGE} → ${SENSOR_VM}) ==="
+  echo "sensor_mgmt_interface=${sensor_mgmt_iface:-unknown}"
+  echo "sensor_capture_interface=${sensor_capture_iface:-unknown}"
+  echo "mirror_output_port=${output_name:-unknown}"
+  if [[ -n "${sensor_capture_iface}" && "${output_name:-}" == "${sensor_capture_iface}" ]]; then
+    echo "mirror_bound_to_capture_interface=true"
+  else
+    echo "mirror_bound_to_capture_interface=false"
+  fi
   for row in "${RESULTS[@]}"; do
     IFS=$'\t' read -r status id detail <<<"${row}"
     printf '[%s] %-22s %s\n' "${status}" "${id}" "${detail}"

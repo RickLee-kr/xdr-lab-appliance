@@ -12,11 +12,13 @@
 #   scripts/nat_state.py
 #   scripts/snapshot_state.py
 #   scripts/caldera_orchestration.py
+#   scripts/image_download_manager.py
 #   scripts/windows_lab_helpers.sh
 #   scripts/vnc_proxy_helpers.sh
 #   scripts/xdr-lab-vm-manager.sh <-- installed to ${XDR_ROOT}/scripts/
 #   config/paths.sh                 <-- installed to ${XDR_ROOT}/config/
 #   config/lab-vms.json             <-- installed to ${XDR_ROOT}/config/
+#   config/images-manifest.json     <-- installed to ${XDR_ROOT}/config/
 
 set -euo pipefail
 
@@ -64,12 +66,14 @@ mkdir -p \
 
 install -m 0644 "${SRC_CONFIG}/paths.sh"              "${XDR_ROOT}/config/paths.sh"
 install -m 0644 "${SRC_CONFIG}/lab-vms.json"          "${XDR_ROOT}/config/lab-vms.json"
+install -m 0644 "${SRC_CONFIG}/images-manifest.json"  "${XDR_ROOT}/config/images-manifest.json"
 install -m 0644 "${SRC_CONFIG}/caldera-lab.json"      "${XDR_ROOT}/config/caldera-lab.json"
 install -m 0644 "${SRC_SCRIPTS}/vm_runtime_state.py"   "${XDR_ROOT}/scripts/vm_runtime_state.py"
 install -m 0644 "${SRC_SCRIPTS}/ovs_mirror_state.py"   "${XDR_ROOT}/scripts/ovs_mirror_state.py"
 install -m 0644 "${SRC_SCRIPTS}/nat_state.py"          "${XDR_ROOT}/scripts/nat_state.py"
 install -m 0644 "${SRC_SCRIPTS}/snapshot_state.py"     "${XDR_ROOT}/scripts/snapshot_state.py"
 install -m 0644 "${SRC_SCRIPTS}/caldera_orchestration.py" "${XDR_ROOT}/scripts/caldera_orchestration.py"
+install -m 0644 "${SRC_SCRIPTS}/image_download_manager.py" "${XDR_ROOT}/scripts/image_download_manager.py"
 install -m 0644 "${SRC_SCRIPTS}/caldera_api_key_resolve.py" "${XDR_ROOT}/scripts/caldera_api_key_resolve.py"
 install -m 0644 "${SRC_SCRIPTS}/caldera_api_key_util.py" "${XDR_ROOT}/scripts/caldera_api_key_util.py"
 install -m 0644 "${SRC_SCRIPTS}/caldera_key_crypto.py" "${XDR_ROOT}/scripts/caldera_key_crypto.py"
@@ -145,7 +149,7 @@ configure_group_tree_writable() {
   ensure_xdr_lab_group
   chown -R root:root "${XDR_ROOT}/config" "${XDR_ROOT}/scripts" "${XDR_ROOT}/bootstrap" "${XDR_ROOT}/installer"
   chmod 0755 "${XDR_ROOT}/config" "${XDR_ROOT}/scripts" "${XDR_ROOT}/bootstrap" "${XDR_ROOT}/installer"
-  for _dir in "${XDR_ROOT}/logs" "${XDR_ROOT}/runtime" "${XDR_ROOT}/runtime/state"; do
+  for _dir in "${XDR_ROOT}/logs" "${XDR_ROOT}/runtime" "${XDR_ROOT}/runtime/state" "${XDR_ROOT}/images"; do
     chown root:"${XDR_LAB_GROUP}" "${_dir}"
     chmod 2775 "${_dir}"
     if command -v setfacl >/dev/null 2>&1; then
@@ -153,6 +157,12 @@ configure_group_tree_writable() {
       setfacl -d -m "g:${XDR_LAB_GROUP}:rwx" "${_dir}" 2>/dev/null || true
     fi
   done
+  if [[ -d "${XDR_ROOT}/images" ]]; then
+    find "${XDR_ROOT}/images" -type d -exec chown root:"${XDR_LAB_GROUP}" {} \;
+    find "${XDR_ROOT}/images" -type d -exec chmod 2775 {} \;
+    find "${XDR_ROOT}/images" -type f -exec chown root:"${XDR_LAB_GROUP}" {} \;
+    find "${XDR_ROOT}/images" -type f -exec chmod g+rw {} \;
+  fi
   for _logf in \
     host-runtime-validation.log \
     vm-manager.log \
@@ -169,16 +179,22 @@ configure_group_tree_writable() {
 
 configure_group_tree_writable
 
+configure_etc_xdr_lab_permissions() {
+  ensure_xdr_lab_group
+  mkdir -p /etc/xdr-lab
+  chown root:"${XDR_LAB_GROUP}" /etc/xdr-lab
+  chmod 0750 /etc/xdr-lab
+}
+
 configure_caldera_api_key_readable() {
   local etc_key="/etc/xdr-lab/caldera-api-key"
   local resolver="${SRC_SCRIPTS}/caldera_api_key_resolve.py"
-  mkdir -p /etc/xdr-lab "${XDR_ROOT}/runtime"
+  mkdir -p "${XDR_ROOT}/runtime"
+  configure_etc_xdr_lab_permissions
   if [[ -f "${etc_key}" ]]; then
     if getent group "${XDR_LAB_GROUP}" >/dev/null 2>&1; then
       chown root:"${XDR_LAB_GROUP}" "${etc_key}"
       chmod 0640 "${etc_key}"
-      chown root:"${XDR_LAB_GROUP}" /etc/xdr-lab
-      chmod 0750 /etc/xdr-lab
     fi
   fi
   if [[ -f "${resolver}" ]]; then
@@ -188,6 +204,22 @@ configure_caldera_api_key_readable() {
 }
 
 configure_caldera_api_key_readable
+
+configure_stellar_download_credentials_readable() {
+  local stellar_env="/etc/xdr-lab/stellar-download.env"
+  configure_etc_xdr_lab_permissions
+  if [[ -f "${stellar_env}" ]]; then
+    chown root:"${XDR_LAB_GROUP}" "${stellar_env}"
+    chmod 0640 "${stellar_env}"
+    echo "Normalized Stellar download credential file permissions: ${stellar_env} owner=root group=${XDR_LAB_GROUP} mode=0640"
+  else
+    echo "Stellar download credential file not found: ${stellar_env}"
+    echo "Create it when credentials are available; installer will not create an empty credential file."
+    echo "Expected permissions after creation: owner=root group=${XDR_LAB_GROUP} mode=0640"
+  fi
+}
+
+configure_stellar_download_credentials_readable
 
 systemctl daemon-reload
 
@@ -252,6 +284,7 @@ install_cli_editable
 echo "Installed aella_cli (${CLI_INSTALL_MODE}) and ${XDR_ROOT} lab assets."
 if [[ -n "${XDR_LAB_OPERATOR_USER}" && "${XDR_LAB_OPERATOR_USER}" != "root" ]]; then
   echo "Operator ${XDR_LAB_OPERATOR_USER} added to group ${XDR_LAB_GROUP} (re-login for new group membership)."
+  echo "Current shells may not see the new group yet; run: id; groups; newgrp ${XDR_LAB_GROUP}"
   echo "Logs: ${XDR_ROOT}/logs (group-writable; setgid 2775)."
 fi
 echo ""

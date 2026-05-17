@@ -61,7 +61,7 @@ The lab is designed to be **rebuilt from source** at any time:
                           └────────└──────────────┘
 
 Mirror plane:
-    OVS port-mirror: tap.* (any) → sensor-vm tap (rx-only)
+    OVS port-mirror: tap.* (any) → sensor-vm capture tap (rx-only, no IP)
 External access:
     host ens192:1022  → sensor-vm:22
     host ens192:3389  → windows-victim:3389
@@ -136,6 +136,9 @@ only and do not satisfy operational readiness.
 - A single OVS bridge `br0` carries all lab traffic (definition:
   `config/ovs-net.xml`, registered with `virsh net-define`).
 - All VMs attach via `--network network=ovs-net,model=virtio`.
+- `sensor-vm` is the only dual-NIC VM: NIC #1 is management on
+  `ovs-net` with static IP `10.10.10.10`; NIC #2 is a dedicated capture
+  interface with no IP/gateway and is the only supported OVS mirror target.
 - Static IPs are assigned by cloud-init (`network-config` on the seed
   ISO) — DHCP is intentionally **not** used inside the lab.
 - The VM manager (`scripts/xdr-lab-vm-manager.sh`) is the single point
@@ -208,13 +211,15 @@ Example `nat.json` shape (abridged): `docs/examples/runtime-state/nat.json.examp
 
 `sensor-vm` receives a copy of every frame seen by every other lab
 `tap*` interface via an OVS port mirror (`select_all=true,
-output_port=<sensor tap>`). The mirror is one-directional: the sensor
-cannot inject traffic. This is the substrate for IDS / packet capture
-without re-cabling the lab.
+output_port=<sensor capture tap>`). The mirror is one-directional: the
+sensor capture NIC is a packet sink with no IP/gateway and no management
+traffic. This is the substrate for IDS / packet capture without re-cabling
+the lab.
 
-The sensor management NIC attaches to `br0`; traffic collection remains the
-existing OVS mirror path. Do not use the upstream deploy script's SPAN mode on
-Ubuntu 20.04+/22.04+/24.04 appliance hosts.
+The sensor management NIC attaches to `br0` for SSH/API/UI/reverse NAT.
+Management NIC mirror reuse is deprecated, unsupported, and dev-only legacy.
+Do not use the upstream deploy script's SPAN mode on Ubuntu
+20.04+/22.04+/24.04 appliance hosts.
 
 See `docs/specs/007-ovs-mirror-policy/spec.md` for the policy and
 `docs/skills/ovs-mirror-skill.md` for the operational runbook.

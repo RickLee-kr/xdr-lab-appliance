@@ -22,6 +22,11 @@ Governed by spec 004. Read before changing the sensor branch in
   `bridge=br0` (M-10), `internal_ip=10.10.10.10`,
   `netmask`/`gateway`/`dns` from `lab-vms.json::network`,
   `hostname` from `lab-vms.json::vms.sensor-vm.hostname`.
+- Stellar Sensor MUST use a dedicated capture interface. NIC #1 is
+  management (`ovs-net`, `10.10.10.10`, SSH/API/UI/reverse NAT). NIC #2
+  is capture only: no IP, no gateway, no management traffic.
+- Management NIC MUST NOT be used as OVS mirror output. Single-NIC mirror
+  reuse is deprecated, unsupported, and dev-only legacy.
 
 ## Mandatory argument vector
 
@@ -49,6 +54,10 @@ The sensor deploy path MUST NOT pass SPAN-mode flags (spec 004
 governed by spec 007. Coupling SPAN to sensor deploy makes mirror
 recovery require a sensor redeploy, which is unacceptable.
 
+After the upstream deploy script creates NIC #1, `deploy_sensor_vm` MUST
+attach or verify NIC #2 as the capture interface. Mirror apply/verify uses
+NIC #2 only.
+
 ## Download / cache invariants
 
 `download_vm_image sensor-vm` (spec 003 §3.1) MUST place, under the declared
@@ -69,6 +78,9 @@ When upstream Stellar Sensor artifacts are absent, readiness MUST fail with:
 - `sensor_type=stellar_sensor`
 - `stellar_sensor_artifact_found=false`
 - `stellar_sensor_ready=false`
+- `sensor_capture_nic_present=false` when the capture NIC is absent
+- `sensor_capture_nic_mirror_target=false` when OVS mirror is not bound
+  to the capture NIC
 
 The required upstream artifacts are:
 
@@ -95,6 +107,8 @@ must not pass operational readiness.
 
 - `virsh dominfo sensor-vm` succeeds → `validate_sensor_deployment
   virsh_ok`.
+- `virsh domiflist sensor-vm` must show two `vnet*` interfaces:
+  management first, capture second.
 - `virsh dominfo` fails → `validate_sensor_deployment virsh_missing`
   (WARN, soft failure — the upstream script might use a different
   domain name).
@@ -115,6 +129,8 @@ must not pass operational readiness.
   upstream script owns the libvirt-define step (M-13).
 - **…pass the deploy script's SPAN mode "because the sensor needs to see traffic":**
   stop. Mirror configuration is spec 007's job.
+- **…reuse the management NIC as mirror output because only one vnet exists:**
+  stop. Attach/redeploy the dedicated capture NIC.
 - **…hard-code `10.10.10.10` outside `lab-vms.json`:** stop. It's
   declared once.
 - **…re-download the sensor script during `deploy` when

@@ -74,7 +74,8 @@ Scripts install to `${XDR_ROOT}/bootstrap/` (default `/opt/xdr-lab/bootstrap/`).
 | --- | --- | --- |
 | Host network | `sudo ${XDR_ROOT}/bootstrap/validate-host-network.sh` | `br0` UP, gateway IP, OVS, `ovs-net`, forward, NAT contract |
 | libvirt | `${XDR_ROOT}/bootstrap/validate-libvirt.sh` | `libvirtd` + `qemu:///system` + active `ovs-net` |
-| Sensor identity | `${XDR_ROOT}/bootstrap/validate-sensor-identity.sh` | `sensor_type=stellar_sensor`, versioned Stellar sensor artifacts present, no deprecated cloud-image runtime |
+| Sensor identity | `${XDR_ROOT}/bootstrap/validate-sensor-identity.sh` | `sensor_type=stellar_sensor`, versioned Stellar sensor artifacts present, dedicated capture NIC present/no IP/mirror target, no deprecated cloud-image runtime |
+| OVS mirror | `${XDR_ROOT}/bootstrap/validate-ovs-mirror.sh` | Mirror output-port is the sensor capture NIC, never the management NIC |
 | CALDERA | `${XDR_ROOT}/bootstrap/validate-caldera.sh` | Process, listen port, HTTP probes |
 | Web console | `${XDR_ROOT}/bootstrap/validate-web-console.sh` | Running Windows VMs: websockify → `127.0.0.1` QEMU VNC (see `docs/web-console.md`) |
 | Self-heal | `sudo ${XDR_ROOT}/bootstrap/fix-runtime-state.sh` | Safe fixes applied (see §5) |
@@ -170,6 +171,7 @@ source ${XDR_ROOT}/config/paths.sh
 ${XDR_ROOT}/bootstrap/validate-host-network.sh
 ${XDR_ROOT}/bootstrap/validate-libvirt.sh
 ${XDR_ROOT}/bootstrap/validate-sensor-identity.sh
+${XDR_ROOT}/bootstrap/validate-ovs-mirror.sh
 ${XDR_ROOT}/bootstrap/validate-caldera.sh
 aella_cli lab nat verify
 aella_cli lab status all
@@ -210,7 +212,8 @@ aella_cli lab scenario agent status
 | --- | --- |
 | `validate-host-network.sh` | Exit **0** without manual `ip` commands |
 | `validate-libvirt.sh` | Exit **0** |
-| `validate-sensor-identity.sh` | Exit **0** with `stellar_sensor_ready=true` |
+| `validate-sensor-identity.sh` | Exit **0** with `stellar_sensor_ready=true`, `sensor_capture_nic_present=true`, `sensor_capture_nic_has_ip=false`, `sensor_capture_nic_mirror_target=true` |
+| `validate-ovs-mirror.sh` | Exit **0** with `mirror_bound_to_capture_interface=true`; management NIC as output-port is FAIL |
 | `validate-caldera.sh` | Exit **0** or documented bind on `127.0.0.1` only with guest path waived |
 | Guest gateway | From `linux-server`: `ping -c2 10.10.10.1` |
 | Sandcat | `agent status` shows expected roles after reboot |

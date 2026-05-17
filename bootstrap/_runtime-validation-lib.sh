@@ -1289,12 +1289,12 @@ rv_domiflist_source_targets_bridge() {
   [[ "${net_bridge}" == "${bridge}" ]]
 }
 
-# Discover the sensor tap (vnetN) on LAB_BRIDGE via virsh domiflist (qemu:///system).
-rv_sensor_vnet_on_bridge() {
+# Discover all sensor taps (vnetN) on LAB_BRIDGE via virsh domiflist (qemu:///system).
+rv_sensor_vnets_on_bridge() {
   local vm="$1" bridge="${2:-${LAB_BRIDGE}}"
   local domiflist ports_out ports_rc=0
   local iface source row stale_iface="" stale_source=""
-  local -a vnet_rows=()
+  local -a vnet_rows=() matched_rows=()
 
   domiflist="$(rv_virsh_system_domiflist "${vm}" 2>/dev/null)" || true
   if [[ -z "${domiflist}" ]]; then
@@ -1337,12 +1337,17 @@ rv_sensor_vnet_on_bridge() {
       continue
     fi
     if [[ -z "${ports_out}" ]] || grep -qxF "${iface}" <<<"${ports_out}"; then
-      echo "${iface}"
-      return 0
+      matched_rows+=("${iface}")
+      continue
     fi
     stale_iface="${iface}"
     stale_source="${source}"
   done
+
+  if [[ "${#matched_rows[@]}" -gt 0 ]]; then
+    printf '%s\n' "${matched_rows[@]}"
+    return 0
+  fi
 
   if [[ -n "${stale_iface}" ]]; then
     echo "VM interface ${stale_iface} found via ${stale_source} but not present on OVS bridge ${bridge}" >&2
@@ -1351,6 +1356,29 @@ rv_sensor_vnet_on_bridge() {
 
   echo "No libvirt vnet interface found for ${vm}" >&2
   return 1
+}
+
+# Legacy helper: first sensor tap is the management NIC.
+rv_sensor_vnet_on_bridge() {
+  rv_sensor_vnets_on_bridge "$@" | head -n1
+}
+
+rv_sensor_mgmt_vnet_on_bridge() {
+  rv_sensor_vnets_on_bridge "$@" | head -n1
+}
+
+# Official Stellar sensor model: first tap is management, second tap is capture.
+rv_sensor_capture_vnet_on_bridge() {
+  local vm="$1" bridge="${2:-${LAB_BRIDGE}}"
+  local taps
+  taps="$(rv_sensor_vnets_on_bridge "${vm}" "${bridge}")" || return 1
+  local count
+  count="$(printf '%s\n' "${taps}" | awk 'NF {n++} END {print n+0}')"
+  if [[ "${count}" -lt 2 ]]; then
+    echo "Dedicated capture interface missing for ${vm}; single-NIC mirror reuse is unsupported" >&2
+    return 1
+  fi
+  printf '%s\n' "${taps}" | awk 'NF {n++; if (n == 2) {print; exit}}'
 }
 
 rv_ovs_br_exists() {

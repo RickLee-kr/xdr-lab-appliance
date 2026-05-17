@@ -108,7 +108,7 @@ guest growth.
 ## 5. Mirror traffic sizing considerations
 
 - The OVS mirror copies **ingress frames** from selected lab tap ports to
-  the sensor output port (rx-only semantics; see spec 007).
+  the sensor dedicated capture output port (rx-only semantics; see spec 007).
 - **Rule of thumb**: the sensor sees **roughly one extra copy** of each
   mirrored frame compared with a non-mirrored lab. Budget sensor **disk
   and CPU for PCAP/IDS** in proportion to expected **east-west Mbps**
@@ -141,6 +141,9 @@ High-level view (same story as `README.md` §2):
 - **`br0` + `ovs-net`**: **Open vSwitch bridge** `br0` with libvirt
   network **`ovs-net`** using `<virtualport type='openvswitch'/>` (see
   `config/ovs-net.xml`); all lab VMs attach here.
+- **Sensor dual NIC**: `sensor-vm` has NIC #1 management on `ovs-net`
+  with `10.10.10.10` and NIC #2 capture with no IP/gateway. The capture
+  NIC is the only supported OVS mirror output-port.
 - **Lab subnet**: `10.10.10.0/24`, gateway `10.10.10.1` on the host.
 - **Static addressing**: Per-VM IPs from `lab-vms.json` and cloud-init
   seeds — **no lab DHCP**.
@@ -175,9 +178,18 @@ When the real Stellar sensor is present, validators report:
 ```text
 sensor_type=stellar_sensor
 stellar_sensor_artifact_found=true
+sensor_capture_nic_present=true
+sensor_capture_nic_has_ip=false
+sensor_capture_nic_mirror_target=true
 stellar_sensor_ready=true
 READY_FOR_STELLAR_SENSOR_SCENARIO=true
 ```
+
+`READY_FOR_STELLAR_SENSOR_SCENARIO=true` requires all of the following:
+Stellar artifacts present, no deprecated cloud-image runtime, capture NIC
+present, capture NIC has no IP, capture NIC is the OVS mirror output-port,
+and management/capture separation is valid. Single-NIC mirror reuse is
+unsupported and must remain false.
 
 Install upstream artifacts explicitly:
 

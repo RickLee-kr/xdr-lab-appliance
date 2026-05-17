@@ -114,6 +114,9 @@ aella_cli lab mirror verify
 ```
 
 **Pass:** `verify` exit 0 when mirror consistent on **`br0`**.
+Output must show `sensor_mgmt_interface`, `sensor_capture_interface`,
+`mirror_output_port`, and `mirror_bound_to_capture_interface=true`.
+If the mirror output is the management NIC, validation must fail.
 
 ---
 
@@ -128,7 +131,9 @@ ${XDR_ROOT:-/opt/xdr-lab}/bootstrap/validate-appliance.sh --strict
 ```
 
 **Pass:** output includes `sensor_type=stellar_sensor`,
-`stellar_sensor_artifact_found=true`, `stellar_sensor_ready=true`, and
+`stellar_sensor_artifact_found=true`, `sensor_capture_nic_present=true`,
+`sensor_capture_nic_has_ip=false`, `sensor_capture_nic_mirror_target=true`,
+`stellar_sensor_ready=true`, and
 `READY_FOR_STELLAR_SENSOR_SCENARIO=true`.
 
 ---

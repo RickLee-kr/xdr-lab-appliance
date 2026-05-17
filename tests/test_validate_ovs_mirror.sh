@@ -68,12 +68,14 @@ while [[ $# -gt 0 ]]; do
 Interface   Type     Source    Model    MAC
 ------------------------------------------------------------
 ${MOCK_SENSOR_IFACE:-vnet0}       ${MOCK_SENSOR_TYPE:-bridge}   ${MOCK_SENSOR_BRIDGE:-ovs-net}   ${MOCK_SENSOR_MODEL:-virtio}   ${MOCK_SENSOR_MAC:-52:54:00:9b:77:4c}
+${MOCK_SENSOR_CAPTURE_IFACE:-vnet1}       ${MOCK_SENSOR_TYPE:-bridge}   ${MOCK_SENSOR_CAPTURE_BRIDGE:-${MOCK_SENSOR_BRIDGE:-ovs-net}}   ${MOCK_SENSOR_MODEL:-virtio}   ${MOCK_SENSOR_CAPTURE_MAC:-52:54:00:9b:77:4d}
 EOF
       else
         cat <<EOF
  Interface  Type     Source   Model       MAC
 -----------------------------------------------------------
  ${MOCK_SENSOR_IFACE:-vnet3}  bridge   ${MOCK_SENSOR_BRIDGE:-br0}   virtio      52:54:00:00:00:01
+ ${MOCK_SENSOR_CAPTURE_IFACE:-vnet4}  bridge   ${MOCK_SENSOR_CAPTURE_BRIDGE:-${MOCK_SENSOR_BRIDGE:-br0}}   virtio      52:54:00:00:00:02
 EOF
       fi
       exit 0
@@ -141,7 +143,7 @@ if [[ "${cmd}" == *"list mirror"* && "${cmd}" == *select_all* ]]; then
   exit 0
 fi
 if [[ "${cmd}" == *"list port uuid-port-1"* ]]; then
-  echo "${MOCK_MIRROR_OUTPUT_PORT:-vnet3}"
+  echo "${MOCK_MIRROR_OUTPUT_PORT:-vnet4}"
   exit 0
 fi
 if [[ "${cmd}" == *mirrors* && "${cmd}" == *"list bridge br0"* ]]; then
@@ -151,7 +153,8 @@ if [[ "${cmd}" == *mirrors* && "${cmd}" == *"list bridge br0"* ]]; then
   exit 0
 fi
 if [[ "${cmd}" == *"list-ports br0"* ]]; then
-  echo "${MOCK_OVS_PORTS:-${MOCK_SENSOR_IFACE:-vnet3}}"
+  echo "${MOCK_OVS_PORTS:-${MOCK_SENSOR_IFACE:-vnet3}
+${MOCK_SENSOR_CAPTURE_IFACE:-vnet4}}"
   exit 0
 fi
 if [[ "${cmd}" == *"get port"* || "${cmd}" == *"create mirror"* || "${cmd}" == *"set bridge"* \
@@ -187,14 +190,16 @@ run_validate() {
       SHELL="${SHELL:-/bin/bash}" \
       MOCK_SENSOR_STATE="${MOCK_SENSOR_STATE:-running}" \
       MOCK_SENSOR_IFACE="${MOCK_SENSOR_IFACE:-vnet3}" \
+      MOCK_SENSOR_CAPTURE_IFACE="${MOCK_SENSOR_CAPTURE_IFACE:-vnet4}" \
       MOCK_SENSOR_BRIDGE="${MOCK_SENSOR_BRIDGE:-br0}" \
+      MOCK_SENSOR_CAPTURE_BRIDGE="${MOCK_SENSOR_CAPTURE_BRIDGE:-${MOCK_SENSOR_BRIDGE:-br0}}" \
       MOCK_DOMIFLIST_FORMAT="${MOCK_DOMIFLIST_FORMAT:-legacy}" \
       MOCK_SENSOR_TYPE="${MOCK_SENSOR_TYPE:-bridge}" \
       MOCK_SENSOR_MODEL="${MOCK_SENSOR_MODEL:-virtio}" \
       MOCK_SENSOR_MAC="${MOCK_SENSOR_MAC:-52:54:00:00:00:01}" \
       MOCK_MIRROR_EXISTS="${MOCK_MIRROR_EXISTS:-0}" \
       MOCK_MIRROR_UUID="${MOCK_MIRROR_UUID:-uuid-mirror-1}" \
-      MOCK_MIRROR_OUTPUT_PORT="${MOCK_MIRROR_OUTPUT_PORT:-vnet3}" \
+      MOCK_MIRROR_OUTPUT_PORT="${MOCK_MIRROR_OUTPUT_PORT:-vnet4}" \
       MOCK_MIRROR_SELECT_ALL="${MOCK_MIRROR_SELECT_ALL:-true}" \
       MOCK_BR0_EXISTS="${MOCK_BR0_EXISTS:-1}" \
       MOCK_OVS_PERMISSION="${MOCK_OVS_PERMISSION:-0}" \
@@ -214,7 +219,9 @@ run_ensure() {
     SHELL="${SHELL:-/bin/bash}" \
     MOCK_SENSOR_STATE="${MOCK_SENSOR_STATE:-running}" \
     MOCK_SENSOR_IFACE="${MOCK_SENSOR_IFACE:-vnet3}" \
+    MOCK_SENSOR_CAPTURE_IFACE="${MOCK_SENSOR_CAPTURE_IFACE:-vnet4}" \
     MOCK_SENSOR_BRIDGE="${MOCK_SENSOR_BRIDGE:-br0}" \
+    MOCK_SENSOR_CAPTURE_BRIDGE="${MOCK_SENSOR_CAPTURE_BRIDGE:-${MOCK_SENSOR_BRIDGE:-br0}}" \
     MOCK_DOMIFLIST_FORMAT="${MOCK_DOMIFLIST_FORMAT:-legacy}" \
     MOCK_SENSOR_TYPE="${MOCK_SENSOR_TYPE:-bridge}" \
     MOCK_SENSOR_MODEL="${MOCK_SENSOR_MODEL:-virtio}" \
@@ -222,7 +229,7 @@ run_ensure() {
     MOCK_OVS_PORTS="${MOCK_OVS_PORTS:-}" \
     MOCK_MIRROR_EXISTS="${MOCK_MIRROR_EXISTS:-0}" \
     MOCK_MIRROR_UUID="${MOCK_MIRROR_UUID:-uuid-mirror-1}" \
-    MOCK_MIRROR_OUTPUT_PORT="${MOCK_MIRROR_OUTPUT_PORT:-vnet3}" \
+    MOCK_MIRROR_OUTPUT_PORT="${MOCK_MIRROR_OUTPUT_PORT:-vnet4}" \
     MOCK_MIRROR_SELECT_ALL="${MOCK_MIRROR_SELECT_ALL:-true}" \
     MOCK_BR0_EXISTS="${MOCK_BR0_EXISTS:-1}" \
     MOCK_OVS_PERMISSION="${MOCK_OVS_PERMISSION:-0}" \
@@ -236,8 +243,8 @@ test_valid_mirror_pass() {
   tmp="$(mktemp -d)"
   write_mock_virsh "${tmp}"
   write_mock_ovs_vsctl "${tmp}"
-  MOCK_SENSOR_STATE=running MOCK_SENSOR_IFACE=vnet3 MOCK_MIRROR_EXISTS=1
-  MOCK_MIRROR_OUTPUT_PORT=vnet3 MOCK_MIRROR_SELECT_ALL=true MOCK_BR0_EXISTS=1
+  MOCK_SENSOR_STATE=running MOCK_SENSOR_IFACE=vnet3 MOCK_SENSOR_CAPTURE_IFACE=vnet4 MOCK_MIRROR_EXISTS=1
+  MOCK_MIRROR_OUTPUT_PORT=vnet4 MOCK_MIRROR_SELECT_ALL=true MOCK_BR0_EXISTS=1
   set +e
   out="$(run_validate "${tmp}" 2>&1)"
   rc=$?
@@ -286,6 +293,7 @@ test_stale_vnet() {
   write_mock_virsh "${tmp}"
   write_mock_ovs_vsctl "${tmp}"
   export MOCK_SENSOR_STATE=running MOCK_SENSOR_IFACE=vnet5
+  export MOCK_SENSOR_CAPTURE_IFACE=vnet6
   export MOCK_MIRROR_EXISTS=1 MOCK_MIRROR_OUTPUT_PORT=vnet3 MOCK_MIRROR_SELECT_ALL=true
   set +e
   out="$(run_validate "${tmp}" 2>&1)"
@@ -301,7 +309,7 @@ test_missing_mirror() {
   tmp="$(mktemp -d)"
   write_mock_virsh "${tmp}"
   write_mock_ovs_vsctl "${tmp}"
-  export MOCK_SENSOR_STATE=running MOCK_SENSOR_IFACE=vnet3 MOCK_MIRROR_EXISTS=0
+  export MOCK_SENSOR_STATE=running MOCK_SENSOR_IFACE=vnet3 MOCK_SENSOR_CAPTURE_IFACE=vnet4 MOCK_MIRROR_EXISTS=0
   set +e
   out="$(run_validate "${tmp}" 2>&1)"
   rc=$?
@@ -341,14 +349,16 @@ test_ensure_idempotent_dry_run() {
   tmp="$(mktemp -d)"
   write_mock_virsh "${tmp}"
   write_mock_ovs_vsctl "${tmp}"
-  export MOCK_SENSOR_STATE=running MOCK_SENSOR_IFACE=vnet3
-  export MOCK_MIRROR_EXISTS=1 MOCK_MIRROR_OUTPUT_PORT=vnet3 MOCK_MIRROR_SELECT_ALL=true
+  export MOCK_SENSOR_STATE=running MOCK_SENSOR_IFACE=vnet3 MOCK_SENSOR_CAPTURE_IFACE=vnet4
+  export MOCK_OVS_PORTS=$'vnet3\nvnet4'
+  export MOCK_MIRROR_EXISTS=1 MOCK_MIRROR_OUTPUT_PORT=vnet4 MOCK_MIRROR_SELECT_ALL=true
   set +e
   out="$(run_ensure "${tmp}" --dry-run 2>&1)"
   rc=$?
   set -e
   assert_eq "ensure dry-run exit" "0" "${rc}"
   assert_contains "ensure dry-run noop" "idempotent noop" "${out}"
+  unset MOCK_OVS_PORTS
   rm -rf "${tmp}"
 }
 
@@ -357,16 +367,16 @@ test_sensor_vnet_via_ovs_net_source() {
   tmp="$(mktemp -d)"
   write_mock_virsh "${tmp}"
   write_mock_ovs_vsctl "${tmp}"
-  export MOCK_SENSOR_STATE=running MOCK_SENSOR_IFACE=vnet0 MOCK_SENSOR_BRIDGE=ovs-net
+  export MOCK_SENSOR_STATE=running MOCK_SENSOR_IFACE=vnet0 MOCK_SENSOR_CAPTURE_IFACE=vnet1 MOCK_SENSOR_BRIDGE=ovs-net
   export MOCK_DOMIFLIST_FORMAT=ovs-net MOCK_MIRROR_EXISTS=1
-  export MOCK_MIRROR_OUTPUT_PORT=vnet0 MOCK_MIRROR_SELECT_ALL=true MOCK_BR0_EXISTS=1
+  export MOCK_MIRROR_OUTPUT_PORT=vnet1 MOCK_MIRROR_SELECT_ALL=true MOCK_BR0_EXISTS=1
   set +e
   out="$(run_validate "${tmp}" 2>&1)"
   rc=$?
   set -e
   assert_eq "ovs-net source domiflist exit" "0" "${rc}"
   assert_contains "ovs-net source domiflist pass" "RESULT: PASS" "${out}"
-  assert_contains "ovs-net source vnet iface" "sensor iface=vnet0 on br0" "${out}"
+  assert_contains "ovs-net source vnet iface" "sensor_mgmt_interface=vnet0 sensor_capture_interface=vnet1" "${out}"
   rm -rf "${tmp}"
 }
 
@@ -375,7 +385,7 @@ test_vnet_on_domiflist_missing_on_br0() {
   tmp="$(mktemp -d)"
   write_mock_virsh "${tmp}"
   write_mock_ovs_vsctl "${tmp}"
-  export MOCK_SENSOR_STATE=running MOCK_SENSOR_IFACE=vnet0 MOCK_SENSOR_BRIDGE=ovs-net
+  export MOCK_SENSOR_STATE=running MOCK_SENSOR_IFACE=vnet0 MOCK_SENSOR_CAPTURE_IFACE=vnet1 MOCK_SENSOR_BRIDGE=ovs-net
   export MOCK_DOMIFLIST_FORMAT=ovs-net MOCK_MIRROR_EXISTS=0 MOCK_BR0_EXISTS=1
   export MOCK_OVS_PORTS=vnet3
   set +e
@@ -384,7 +394,7 @@ test_vnet_on_domiflist_missing_on_br0() {
   set -e
   assert_eq "vnet missing on br0 exit" "31" "${rc}"
   assert_contains "vnet missing on br0 detail" \
-    "VM interface vnet0 found via ovs-net but not present on OVS bridge br0" "${out}"
+    "VM interface vnet1 found via ovs-net but not present on OVS bridge br0" "${out}"
   rm -rf "${tmp}"
 }
 

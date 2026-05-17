@@ -2,8 +2,8 @@
 """OVS mirror state probe + traffic validation helper for xdr-lab-vm-manager.sh.
 
 Authoritative responsibilities (read-only by default):
-  * Discover the libvirt-managed vnet interface of the sensor VM on a given
-    OVS bridge (no hard-coded vnetN — interface numbers shift across reboots).
+  * Discover the libvirt-managed management and dedicated capture vnet
+    interfaces of the sensor VM on a given OVS bridge (no hard-coded vnetN).
   * Inspect ovs-vsctl reality (bridge presence, daemon health, mirror entry,
     output-port linkage) and reconcile it against the desired identity
     (bridge, mirror_name, sensor_vm).
@@ -182,8 +182,8 @@ def _which(cmd: str) -> bool:
 # Sensor interface auto-discovery
 # ---------------------------------------------------------------------------
 
-def discover_sensor_iface(vm: str, bridge: str) -> str:
-    """Return the vnetX interface of `vm` attached to `bridge` on the host OVS.
+def discover_sensor_ifaces(vm: str, bridge: str) -> tuple[str, str]:
+    """Return (management_vnet, capture_vnet) for `vm` on the host OVS.
 
     Strategy:
       1. virsh domiflist <vm> — yields rows that expose libvirt's notion of the
@@ -191,29 +191,38 @@ def discover_sensor_iface(vm: str, bridge: str) -> str:
       2. Cross-check ovs-vsctl list-ports <bridge> — only return rows whose
          interface actually shows up on the live OVS bridge (covers the case
          where libvirt thinks it attached but the port hasn't surfaced yet).
-      3. Prefer rows whose Source equals <bridge>. Fall back to bridge-side
-         lookup by MAC if Source doesn't match (e.g. libvirt network alias).
+      3. Preserve libvirt order: NIC #1 is management; NIC #2 is capture.
 
-    Empty string means "not discoverable right now"; callers must NEVER apply
-    a mirror in that case.
+    Empty capture means the official Stellar dual-NIC model is not present;
+    callers must NEVER bind the OVS mirror to management as a fallback.
     """
     rows = virsh_domiflist(vm)
     if not rows:
-        return ""
+        return "", ""
 
     live_ports = set(ovs_list_ports(bridge))
+    matched: list[str] = []
 
-    # Pass 1: exact source==bridge match where iface exists on the bridge.
     for row in rows:
         if row["source"] == bridge and row["interface"] in live_ports:
-            return row["interface"]
+            matched.append(row["interface"])
 
-    # Pass 2: any libvirt iface present on the bridge (covers ovs-net source).
     for row in rows:
-        if row["interface"] in live_ports:
-            return row["interface"]
+        iface = row["interface"]
+        if iface in matched:
+            continue
+        if iface in live_ports:
+            matched.append(iface)
 
-    return ""
+    mgmt = matched[0] if len(matched) >= 1 else ""
+    capture = matched[1] if len(matched) >= 2 else ""
+    return mgmt, capture
+
+
+def discover_sensor_iface(vm: str, bridge: str) -> str:
+    """Return the dedicated capture vnet for mirror use."""
+    _mgmt, capture = discover_sensor_ifaces(vm, bridge)
+    return capture
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +238,10 @@ def inspect_mirror_state(
     """Build the canonical mirror state record. Pure observation, no mutation."""
     ovs_ok = ovs_running()
     bridge_ok = ovs_bridge_exists(bridge) if ovs_ok else False
-    sensor_iface = discover_sensor_iface(sensor_vm, bridge) if bridge_ok else ""
+    sensor_mgmt_iface = ""
+    sensor_capture_iface = ""
+    if bridge_ok:
+        sensor_mgmt_iface, sensor_capture_iface = discover_sensor_ifaces(sensor_vm, bridge)
 
     mirror_uuid = ovs_mirror_uuid(mirror_name) if ovs_ok else ""
     mirror_exists = bool(mirror_uuid)
@@ -244,10 +256,15 @@ def inspect_mirror_state(
     output_port_name = ovs_port_name_by_uuid(output_port_uuid) if output_port_uuid else ""
     output_port_exists = bool(output_port_name)
 
-    output_port_matches_sensor = (
+    output_port_matches_capture = (
         bool(output_port_name)
-        and bool(sensor_iface)
-        and output_port_name == sensor_iface
+        and bool(sensor_capture_iface)
+        and output_port_name == sensor_capture_iface
+    )
+    output_port_is_management = (
+        bool(output_port_name)
+        and bool(sensor_mgmt_iface)
+        and output_port_name == sensor_mgmt_iface
     )
 
     consistent = bool(
@@ -256,7 +273,7 @@ def inspect_mirror_state(
         and mirror_exists
         and attached_to_bridge
         and output_port_exists
-        and output_port_matches_sensor
+        and output_port_matches_capture
     )
 
     return {
@@ -268,11 +285,16 @@ def inspect_mirror_state(
         "mirror_uuid": mirror_uuid or None,
         "mirror_attached_to_bridge": attached_to_bridge,
         "sensor_vm": sensor_vm,
-        "sensor_interface": sensor_iface or None,
+        "sensor_mgmt_interface": sensor_mgmt_iface or None,
+        "sensor_capture_interface": sensor_capture_iface or None,
+        "sensor_interface": sensor_capture_iface or None,
         "sensor_vm_state": virsh_domstate(sensor_vm) or None,
         "output_port_name": output_port_name or None,
         "output_port_exists": output_port_exists,
-        "output_port_matches_sensor": output_port_matches_sensor,
+        "output_port_matches_sensor": output_port_matches_capture,
+        "output_port_matches_capture": output_port_matches_capture,
+        "output_port_is_management": output_port_is_management,
+        "mirror_bound_to_capture_interface": output_port_matches_capture,
         "consistent": consistent,
     }
 
@@ -311,9 +333,14 @@ def build_state_record(
         "mirror_exists": obs["mirror_exists"],
         "mirror_uuid": obs["mirror_uuid"],
         "mirror_attached_to_bridge": obs["mirror_attached_to_bridge"],
+        "sensor_mgmt_interface": obs["sensor_mgmt_interface"],
+        "sensor_capture_interface": obs["sensor_capture_interface"],
         "output_port_name": obs["output_port_name"],
         "output_port_exists": obs["output_port_exists"],
         "output_port_matches_sensor": obs["output_port_matches_sensor"],
+        "output_port_matches_capture": obs["output_port_matches_capture"],
+        "output_port_is_management": obs["output_port_is_management"],
+        "mirror_bound_to_capture_interface": obs["mirror_bound_to_capture_interface"],
         "consistent": obs["consistent"],
         "last_applied_time": last_applied,
         "last_verified_time": now,

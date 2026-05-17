@@ -7,7 +7,8 @@
 
 Define how the lab mirrors east-west traffic on **`br0`** (the same
 **Open vSwitch bridge** used by **`ovs-net`** and
-`<virtualport type='openvswitch'/>`) to the sensor VM's NIC so the
+`<virtualport type='openvswitch'/>`) to the sensor VM's dedicated
+capture NIC so the
 NDR/XDR sensor sees all relevant traffic — **without ever performing a
 destructive OVS operation**.
 
@@ -22,8 +23,9 @@ The canonical model is a **single Open vSwitch bridge `br0`**:
   (see spec 006): **OVS-backed libvirt network** with an **openvswitch
   virtualport**.
 - The **OVS port mirror** is configured **on `br0`**. Lab VM taps and the
-  sensor tap are OVS ports on **`br0`**; the mirror object selects traffic
-  and sets **`output_port`** to the sensor’s port.
+  sensor management/capture taps are OVS ports on **`br0`**; the mirror
+  object selects traffic and sets **`output_port`** to the sensor’s
+  dedicated capture port only.
 
 There is **no** parallel “Linux bridge `br0`” dataplane in this
 architecture: **`br0` is the OVS dataplane** for the lab. Historical
@@ -43,8 +45,18 @@ are **not** the shipped geometry.
                           │   │   │   │
                   Named mirror on br0
                     select_all=true (shipped default)
-                    output_port = sensor tap
+                    output_port = sensor capture tap
 ```
+
+The official Stellar sensor network model is mandatory:
+
+- NIC #1 — management: `ovs-net`, static IP `10.10.10.10`, SSH/API/UI,
+  reverse NAT (`external:1022 -> 10.10.10.10:22`).
+- NIC #2 — capture/SPAN: no IP, no gateway, no management traffic,
+  packet capture only.
+- **Stellar Sensor MUST use dedicated capture interface.**
+- **Management NIC MUST NOT be used as OVS mirror output.**
+- Single-NIC mirror reuse is deprecated, unsupported, and dev-only legacy.
 
 ## 3. Component Responsibilities
 
@@ -89,7 +101,7 @@ policy.
 Verbs (initial):
 
 - `apply` — ensure the named mirror exists on **`br0`** with
-  **`output_port`** set to the discovered sensor interface; use
+  **`output_port`** set to the discovered sensor capture interface; use
   incremental / idempotent `ovs-vsctl` patterns scoped to the mirror name.
 - `verify` — sanity-check mirror existence and **`output_port`** against
   inventory-driven discovery (read-only where possible; non-zero exit on
@@ -120,8 +132,10 @@ when operators need that refresh.
 - **`br0`** exists as an OVS bridge before mirror apply (spec 006 / P-11).
 - VM tap interface names follow libvirt's conventions (e.g. `vnetN`),
   discoverable per VM via `virsh domiflist <vm>`.
-- The sensor VM's NIC is identifiable by its libvirt interface attached
-  to **`br0`** (OVS port).
+- The sensor VM's management and capture NICs are identifiable by their
+  libvirt interfaces attached to **`br0`** (OVS ports). The first is
+  management; the second is capture unless a future schema makes the
+  role explicit in domain metadata.
 
 ## 5. Sensor Port Auto-detection Philosophy
 
@@ -129,16 +143,20 @@ The OVS manager MUST NOT hard-code a `vnetN` index for the sensor or for
 any lab VM. Auto-detection is mandatory:
 
 1. Read the sensor VM name from `lab-vms.json` (or default `sensor-vm`).
-2. Run `virsh domiflist <sensor>` (or equivalent). The interface attached
-   to the lab OVS bridge (**`br0`**) is the sensor’s mirror destination.
+2. Run `virsh domiflist <sensor>` (or equivalent). The sensor must have
+   two interfaces attached to the lab OVS bridge (**`br0`**): management
+   and capture.
 3. For each lab VM in scope, discover its tap interface the same way.
 4. Use the discovered interface names to build mirror parameters as
    implemented (shipped: `select_all=true` on **`br0`** with
-   **`output_port`** = sensor port — consult `ovs_mirror_state.py` for
+   **`output_port`** = sensor capture port — consult `ovs_mirror_state.py` for
    exact reconciliation rules).
 5. Log each discovered mapping at INFO (`mirror_port_discovered vm=… iface=…`).
 
-If discovery fails for any VM (no interface, VM not running), that VM is
+If capture discovery fails (only a management NIC exists), mirror apply and
+verify MUST fail. Falling back to the management NIC is forbidden.
+
+If discovery fails for any non-sensor VM (no interface, VM not running), that VM is
 **skipped with a WARN** structured log where the implementation allows;
 the operator can re-run `mirror apply` after starting the missing VMs.
 
@@ -163,8 +181,9 @@ Every mutation MUST be:
 
 1. **`br0`** exists and OVS is healthy.
 2. The named mirror object exists on **`br0`**.
-3. **`output_port`** references the sensor's discovered interface.
-4. Overall consistency flags in `mirror.json` match engine rules (no fake
+3. **`output_port`** references the sensor's discovered capture interface.
+4. **`output_port`** does not reference the sensor management interface.
+5. Overall consistency flags in `mirror.json` match engine rules (no fake
    success paths).
 
 Each check produces structured logging; an overall `mirror_verify_ok` or
@@ -178,8 +197,8 @@ orchestration.
 - **Mirror object missing.** `apply` recreates it in a scoped way.
 - **Source port missing for a powered-off VM.** WARN / skip patterns per
   implementation; re-run after VMs start.
-- **Sensor port missing.** Hard failure: operator inspects sensor VM and
-  `ovs-net` attachment.
+- **Sensor capture port missing.** Hard failure: operator inspects sensor VM
+  and attaches/redeploys NIC #2. Do not bind the mirror to management.
 - **Operator manually misconfigured the mirror.** Run scoped disable/remove
   of the **named** mirror only, then `mirror apply` again — never
   `emer-reset`.
@@ -226,7 +245,8 @@ A mirror-related change is valid only if:
    identity.
 4. `mirror verify` returns exit 0 only when actual state matches the
    engine’s consistency model.
-5. The sensor's interface is the **`output_port`** for the mirror; the
+5. The sensor's capture interface is the **`output_port`** for the mirror;
+   the sensor management interface MUST NOT be the output-port, and the
    sensor MUST NOT be treated as a mirror source.
 6. Every `ovs-vsctl` invocation is logged via `log_structured` before
    execution where the runtime layer performs mutations.

@@ -36,8 +36,9 @@ model. This spec is the geometry that specs 007 (OVS mirror) and 010
           │   ▼   ▼    ▼       ▼     ▼             ▼
           │ sensor windows linux   test-vm1   OVS port mirror
           │ -vm   -victim -server               (spec 007, same br0)
-          │ 10.10 10.10  10.10    10.10
+          │ mgmt 10.10  10.10    10.10
           │ .10.10 .10.20 .10.30  .10.40
+          │ capture NIC: no IP, mirror output only
           └──────────────────────────────────────┘
 ```
 
@@ -73,6 +74,10 @@ definition (`config/ovs-net.xml`): `<bridge name='br0'/>` with
 - L2 MUST NOT define ad-hoc libvirt networks outside the documented
   lab model (constitution P-5): it does not repurpose `virsh default`
   or other unrelated networks.
+- The Stellar sensor is the only dual-NIC exception: NIC #1 is the
+  management interface on `ovs-net`; NIC #2 is a dedicated capture
+  interface on the declared capture network (default `ovs-net`) with
+  no IP and no gateway.
 
 ### 3.3 Fixed lab subnet
 
@@ -175,9 +180,12 @@ uplink NIC → external network
 
 ## 6. VM Connectivity Philosophy
 
-- Every lab VM has exactly one NIC attached to **`ovs-net`** (therefore
-  to **`br0`** as an OVS port). Multi-NIC designs are out of scope for
-  the current spec.
+- Every non-sensor lab VM has exactly one NIC attached to **`ovs-net`**
+  (therefore to **`br0`** as an OVS port). The Stellar sensor MUST have
+  two NICs: management and dedicated capture.
+- The sensor management NIC carries SSH/API/UI/reverse-NAT traffic at
+  `10.10.10.10`. The capture NIC is a packet sink: no IP, no gateway,
+  no management traffic.
 - VMs use **static internal IPs** declared in `lab-vms.json`. The
   declaration is the source of truth; per-VM OSes are responsible for
   matching it (cloud-init for Linux, deploy-time scripts for Windows,
@@ -218,7 +226,7 @@ uplink NIC → external network
 Lab internal east-west:
   VM_A.tap → br0 (OVS) → VM_B.tap
         ↘ (OVS port mirror on br0)
-          sensor.tap (RX-only copy)  (spec 007)
+          sensor.capture.tap (RX-only copy, no IP)  (spec 007)
 
 Operator ingress to lab service:
   ext_NIC → iptables PREROUTING(XDR_LAB_DNAT) → br0 (OVS) → VM.tap
@@ -256,6 +264,8 @@ Lab egress to internet:
   Historical note: older drafts referred to a Linux-only bridge model;
   the shipped lab uses **OVS `br0` + `ovs-net` + openvswitch
   virtualport**.
+- Using the sensor management NIC as an OVS mirror output-port. Mirror
+  output MUST bind to the dedicated capture NIC only.
 - `iptables -F`, `iptables -t nat -F`, `iptables -X` (constitution
   P-13). Reverse NAT manages only its named chain.
 - Storing additional network state outside `lab-vms.json` (e.g. Python

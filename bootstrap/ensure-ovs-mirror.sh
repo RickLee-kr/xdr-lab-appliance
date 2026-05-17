@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ensure the lab OVS port mirror on br0 targets the running sensor VM tap.
+# Ensure the lab OVS port mirror on br0 targets the running sensor VM capture tap.
 # Idempotent self-heal: removes only the named mirror object, then recreates if needed.
 #
 # Usage:
@@ -58,7 +58,7 @@ mirror_already_consistent() {
   [[ -n "${mirror_uuid}" ]] || return 1
   rv_ovs_mirror_attached_to_bridge "${mirror_uuid}" "${LAB_BRIDGE}" || return 1
   output_name="$(rv_ovs_mirror_output_port_name "${mirror_uuid}" || true)"
-  [[ -n "${output_name}" && "${output_name}" == "${sensor_iface}" ]] || return 1
+  [[ -n "${output_name}" && "${output_name}" == "${sensor_capture_iface}" ]] || return 1
   rv_ovs_mirror_select_all_enabled "${mirror_uuid}"
 }
 
@@ -106,43 +106,50 @@ if ! rv_ovs_br_exists; then
   exit 10
 fi
 
-dom_state="$(rv_virsh_system_domstate "${SENSOR_VM}")"
+dom_state="$(rv_virsh_system_domstate "${SENSOR_VM}" || true)"
 if [[ "${dom_state}" != "running" ]]; then
-  rv_log ERROR "sensor VM not running vm=${SENSOR_VM} state=${dom_state:-unknown}"
-  exit 30
+  # Do not fail solely on an empty domstate probe. The live vnet discovery
+  # below is the authoritative precondition for mirror binding.
+  rv_log WARN "sensor VM domstate not confirmed before vnet discovery vm=${SENSOR_VM} state=${dom_state:-unknown}"
 fi
 
-sensor_iface=""
+sensor_mgmt_iface=""
+sensor_capture_iface=""
 sensor_rc=0
 sensor_vnet_out=""
 set +e
-sensor_vnet_out="$(rv_sensor_vnet_on_bridge "${SENSOR_VM}" "${LAB_BRIDGE}" 2>&1)"
+sensor_vnet_out="$(rv_sensor_vnets_on_bridge "${SENSOR_VM}" "${LAB_BRIDGE}" 2>&1)"
 sensor_rc=$?
 set -e
 if [[ "${sensor_rc}" -eq 0 && -n "${sensor_vnet_out}" ]]; then
-  sensor_iface="${sensor_vnet_out}"
+  sensor_mgmt_iface="$(printf '%s\n' "${sensor_vnet_out}" | awk 'NF {print; exit}')"
+  sensor_capture_iface="$(printf '%s\n' "${sensor_vnet_out}" | awk 'NF {n++; if (n == 2) {print; exit}}')"
 else
   rv_log ERROR "${sensor_vnet_out:-No libvirt vnet interface found for ${SENSOR_VM}}"
   exit 31
 fi
-rv_log INFO "sensor vnet discovered vm=${SENSOR_VM} iface=${sensor_iface}"
+if [[ -z "${sensor_capture_iface}" ]]; then
+  rv_log ERROR "Dedicated capture interface missing for ${SENSOR_VM}; management NIC MUST NOT be used as OVS mirror output"
+  exit 31
+fi
+rv_log INFO "sensor vnets discovered vm=${SENSOR_VM} mgmt_iface=${sensor_mgmt_iface} capture_iface=${sensor_capture_iface}"
 
 if mirror_already_consistent; then
-  rv_log INFO "ensure-ovs-mirror idempotent noop mirror=${XDR_LAB_MIRROR_NAME} iface=${sensor_iface}"
+  rv_log INFO "ensure-ovs-mirror idempotent noop mirror=${XDR_LAB_MIRROR_NAME} capture_iface=${sensor_capture_iface}"
   exit 0
 fi
 
 remove_named_mirror
 if [[ "${DRY_RUN}" -eq 1 ]]; then
-  rv_log INFO "ensure-ovs-mirror dry-run would recreate mirror=${XDR_LAB_MIRROR_NAME} iface=${sensor_iface}"
+  rv_log INFO "ensure-ovs-mirror dry-run would recreate mirror=${XDR_LAB_MIRROR_NAME} capture_iface=${sensor_capture_iface}"
   exit 0
 fi
-run_action "create OVS mirror ${XDR_LAB_MIRROR_NAME}" create_mirror "${sensor_iface}"
+run_action "create OVS mirror ${XDR_LAB_MIRROR_NAME}" create_mirror "${sensor_capture_iface}"
 
 if ! mirror_already_consistent; then
-  rv_log ERROR "post-apply mirror inconsistent mirror=${XDR_LAB_MIRROR_NAME} iface=${sensor_iface}"
+  rv_log ERROR "post-apply mirror inconsistent mirror=${XDR_LAB_MIRROR_NAME} capture_iface=${sensor_capture_iface}"
   exit 40
 fi
 
-rv_log INFO "ensure-ovs-mirror success sensor_vm=${SENSOR_VM} iface=${sensor_iface} mirror=${XDR_LAB_MIRROR_NAME}"
+rv_log INFO "ensure-ovs-mirror success sensor_vm=${SENSOR_VM} mgmt_iface=${sensor_mgmt_iface} capture_iface=${sensor_capture_iface} mirror=${XDR_LAB_MIRROR_NAME}"
 exit 0

@@ -6,13 +6,17 @@ Invoked from xdr-lab-vm-manager.sh only. Emits JSONL events to vm-manager.log.
 from __future__ import annotations
 
 import argparse
+import getpass
+import grp
 import hashlib
 import json
 import os
+import pwd
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -31,6 +35,29 @@ def log_jsonl(log_path: Path | None, event: str, **fields: Any) -> None:
             f.write(line)
     # Mirror to stderr for operator visibility (engine also uses vm-manager.log).
     print(line, end="", file=sys.stderr)
+
+
+def log_download_validation(
+    log_path: Path | None,
+    event: str,
+    *,
+    image: str,
+    path: Path,
+    validation_result: str,
+    **fields: Any,
+) -> None:
+    exists = path.is_file()
+    size = path.stat().st_size if exists else 0
+    log_jsonl(
+        log_path,
+        event,
+        image=image,
+        target_path=str(path),
+        file_exists=exists,
+        file_size=size,
+        validation_result=validation_result,
+        **fields,
+    )
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -99,28 +126,72 @@ def load_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def stellar_credentials(env_file: Path, *, log_path: Path | None) -> tuple[str, str]:
-    file_values = load_env_file(env_file)
-    user = os.environ.get("STELLAR_DOWNLOAD_USER") or file_values.get("STELLAR_DOWNLOAD_USER", "")
-    password = os.environ.get("STELLAR_DOWNLOAD_PASSWORD") or file_values.get(
-        "STELLAR_DOWNLOAD_PASSWORD", ""
+def _current_user_name() -> str:
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        return getpass.getuser() or str(os.geteuid())
+
+
+def _current_group_names() -> list[str]:
+    names: list[str] = []
+    for gid in set(os.getgroups() + [os.getegid()]):
+        try:
+            names.append(grp.getgrgid(gid).gr_name)
+        except KeyError:
+            names.append(str(gid))
+    return sorted(set(names))
+
+
+def _stellar_env_permission_message(env_file: Path) -> str:
+    user_name = _current_user_name()
+    group_names = ", ".join(_current_group_names()) or "(none)"
+    return (
+        "Stellar download credentials file exists but is not readable.\n"
+        f"  current_user={user_name}\n"
+        f"  current_groups={group_names}\n"
+        f"  credential_file={env_file}\n"
+        "  required_owner_group=root:xdr-lab\n"
+        "  required_mode=0640\n"
+        "  remediation=Run installer or: "
+        f"sudo chown root:xdr-lab {env_file} && sudo chmod 640 {env_file} && newgrp xdr-lab\n"
+        "  env_override=Alternatively export STELLAR_DOWNLOAD_USER and "
+        "STELLAR_DOWNLOAD_PASSWORD for this command."
     )
+
+
+def stellar_credentials(env_file: Path, *, log_path: Path | None) -> tuple[str, str]:
+    user = os.environ.get("STELLAR_DOWNLOAD_USER", "")
+    password = os.environ.get("STELLAR_DOWNLOAD_PASSWORD", "")
+    if user and password:
+        return user, password
+
+    try:
+        file_values = load_env_file(env_file)
+    except PermissionError as exc:
+        raise RuntimeError(_stellar_env_permission_message(env_file)) from exc
+
+    user = user or file_values.get("STELLAR_DOWNLOAD_USER", "")
+    password = password or file_values.get("STELLAR_DOWNLOAD_PASSWORD", "")
     if env_file.is_file():
         try:
-            if env_file.stat().st_mode & 0o077:
+            st = env_file.stat()
+            mode = st.st_mode & 0o777
+            group = grp.getgrgid(st.st_gid).gr_name
+            if group != "xdr-lab" or mode != 0o640:
                 log_jsonl(
                     log_path,
                     "stellar_download_env_permissions_warning",
                     path=str(env_file),
-                    recommendation="chmod 600",
+                    recommendation="chown root:xdr-lab and chmod 640",
                 )
-        except OSError:
+        except (KeyError, OSError):
             pass
     if not user or not password:
         raise RuntimeError(
             "Stellar download credentials missing. Set STELLAR_DOWNLOAD_USER and "
             "STELLAR_DOWNLOAD_PASSWORD in the environment or in "
-            f"{env_file} (chmod 600 recommended)."
+            f"{env_file} (owner root:xdr-lab, mode 0640 recommended)."
         )
     return user, password
 
@@ -191,6 +262,10 @@ def which_or_none(name: str) -> str | None:
     return p
 
 
+def curl_config_quote(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "")
+
+
 def download_url(
     url: str,
     dest: Path,
@@ -201,10 +276,9 @@ def download_url(
 ) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.parent / (dest.name + ".part")
-    aria = which_or_none("aria2c")
     curl = which_or_none("curl")
     if dry_run:
-        tool = "aria2c" if aria else "curl" if curl else "(none)"
+        tool = "curl" if curl else "(none)"
         log_jsonl(
             log_path,
             "image_download_started",
@@ -217,44 +291,68 @@ def download_url(
     user = password = ""
     if credentials:
         user, password = credentials
-    if aria:
-        log_jsonl(log_path, "image_download_started", url=url, dest=str(dest), tool="aria2c")
-        cmd = [
-            aria,
-            "-x",
-            "16",
-            "-s",
-            "16",
-            "-c",
-            "-d",
-            str(partial.parent),
-            "-o",
-            partial.name,
-        ]
-        if credentials:
-            cmd.extend(["--http-user", user, "--http-passwd", password])
-        cmd.append(url)
-        r = subprocess.run(cmd, check=False)
-        if r.returncode != 0:
-            log_jsonl(
-                log_path,
-                "image_download_failed",
-                url=url,
-                dest=str(dest),
-                tool="aria2c",
-                rc=r.returncode,
-            )
-            raise RuntimeError(f"aria2c failed (rc={r.returncode}) for {url}")
-        shutil.move(str(partial), str(dest))
-        log_jsonl(log_path, "image_download_success", url=url, dest=str(dest), tool="aria2c")
-        return
     if curl:
         log_jsonl(log_path, "image_download_started", url=url, dest=str(dest), tool="curl")
-        cmd = ["curl", "-fL", "-C", "-", "--retry", "3", "--retry-delay", "2"]
+        if partial.exists():
+            partial.unlink()
+            log_jsonl(
+                log_path,
+                "image_download_partial_removed",
+                url=url,
+                partial=str(partial),
+                reason="clean_download_required",
+            )
+        curl_config_path: Path | None = None
+        cmd = [
+            curl,
+            "-fL",
+            "--retry",
+            "3",
+            "--retry-delay",
+            "2",
+            "--retry-connrefused",
+            "--connect-timeout",
+            "20",
+            "--speed-time",
+            "120",
+            "--speed-limit",
+            "1024",
+            "-w",
+            "%{http_code}",
+        ]
         if credentials:
-            cmd.extend(["--user", f"{user}:{password}"])
-        cmd.extend(["-o", str(dest), url])
-        r = subprocess.run(cmd, check=False)
+            fd, cfg_name = tempfile.mkstemp(prefix="xdr-lab-curl-", suffix=".conf")
+            curl_config_path = Path(cfg_name)
+            with os.fdopen(fd, "w", encoding="utf-8") as cfg:
+                cfg.write(f'user = "{curl_config_quote(user)}:{curl_config_quote(password)}"\n')
+            os.chmod(curl_config_path, 0o600)
+            cmd.extend(["--config", str(curl_config_path)])
+        cmd.extend(["-o", str(partial), url])
+        try:
+            r = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        finally:
+            if curl_config_path is not None:
+                try:
+                    curl_config_path.unlink()
+                except OSError:
+                    pass
+        if r.stderr:
+            print(r.stderr, end="", file=sys.stderr)
+        http_code = (r.stdout or "").strip()
+        partial_exists = partial.is_file()
+        partial_size = partial.stat().st_size if partial_exists else 0
+        log_jsonl(
+            log_path,
+            "image_download_curl_result",
+            url=url,
+            dest=str(dest),
+            partial=str(partial),
+            tool="curl",
+            rc=r.returncode,
+            http_code=http_code,
+            file_exists=partial_exists,
+            file_size=partial_size,
+        )
         if r.returncode != 0:
             log_jsonl(
                 log_path,
@@ -263,9 +361,35 @@ def download_url(
                 dest=str(dest),
                 tool="curl",
                 rc=r.returncode,
+                http_code=http_code,
             )
             raise RuntimeError(f"curl failed (rc={r.returncode}) for {url}")
-        log_jsonl(log_path, "image_download_success", url=url, dest=str(dest), tool="curl")
+        if not partial_exists or partial_size <= 0:
+            log_jsonl(
+                log_path,
+                "image_download_failed",
+                url=url,
+                dest=str(dest),
+                tool="curl",
+                rc=r.returncode,
+                http_code=http_code,
+                reason="missing_or_empty_download",
+                file_exists=partial_exists,
+                file_size=partial_size,
+            )
+            raise RuntimeError(f"curl produced no artifact for {url}")
+        shutil.move(str(partial), str(dest))
+        log_jsonl(
+            log_path,
+            "image_download_success",
+            url=url,
+            dest=str(dest),
+            tool="curl",
+            rc=r.returncode,
+            http_code=http_code,
+            file_exists=dest.is_file(),
+            file_size=dest.stat().st_size if dest.is_file() else 0,
+        )
         return
     raise RuntimeError("Neither aria2c nor curl found in PATH (required for image downloads)")
 
@@ -355,6 +479,74 @@ def infer_artifact_type(image: dict[str, Any], path: Path) -> str:
     return ""
 
 
+def verify_qcow2_image(path: Path, *, image_name: str, log_path: Path | None) -> bool:
+    if not path.is_file():
+        print(f"ERROR: {image_name}: qcow2 image missing: {path}", file=sys.stderr)
+        return False
+    try:
+        magic = path.read_bytes()[:4]
+    except OSError as exc:
+        print(f"ERROR: {image_name}: unable to read qcow2 image {path}: {exc}", file=sys.stderr)
+        return False
+    if magic != b"QFI\xfb":
+        print(f"ERROR: {image_name}: artifact is not a QEMU QCOW2 image: {path}", file=sys.stderr)
+        return False
+    qemu_img = which_or_none("qemu-img")
+    if not qemu_img:
+        log_jsonl(
+            log_path,
+            "image_qcow2_deep_validation_skipped",
+            image=image_name,
+            path=str(path),
+            reason="qemu-img_missing",
+        )
+        return True
+    info = subprocess.run(
+        [qemu_img, "info", "--output=json", str(path)],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if info.returncode != 0:
+        print(f"ERROR: {image_name}: qemu-img info failed for {path}: {info.stderr.strip()}", file=sys.stderr)
+        log_jsonl(
+            log_path,
+            "image_qcow2_deep_validation_failed",
+            image=image_name,
+            path=str(path),
+            phase="info",
+            rc=info.returncode,
+        )
+        return False
+    check = subprocess.run(
+        [qemu_img, "check", str(path)],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if check.returncode != 0:
+        detail = (check.stderr or check.stdout or "").strip()
+        print(f"ERROR: {image_name}: qemu-img check failed for {path}: {detail}", file=sys.stderr)
+        log_jsonl(
+            log_path,
+            "image_qcow2_deep_validation_failed",
+            image=image_name,
+            path=str(path),
+            phase="check",
+            rc=check.returncode,
+        )
+        return False
+    log_jsonl(
+        log_path,
+        "image_qcow2_deep_validation_verified",
+        image=image_name,
+        path=str(path),
+    )
+    return True
+
+
 def verify_artifact_type(
     path: Path,
     artifact_type: str,
@@ -392,16 +584,7 @@ def verify_artifact_type(
             print(f"ERROR: {image_name}: artifact is not an executable shell script: {path}", file=sys.stderr)
             return False
     elif artifact_type == "qcow2":
-        if not path.is_file():
-            print(f"ERROR: {image_name}: qcow2 image missing: {path}", file=sys.stderr)
-            return False
-        try:
-            magic = path.read_bytes()[:4]
-        except OSError as exc:
-            print(f"ERROR: {image_name}: unable to read qcow2 image {path}: {exc}", file=sys.stderr)
-            return False
-        if magic != b"QFI\xfb":
-            print(f"ERROR: {image_name}: artifact is not a QEMU QCOW2 image: {path}", file=sys.stderr)
+        if not verify_qcow2_image(path, image_name=image_name, log_path=log_path):
             return False
     else:
         raise RuntimeError(f"unsupported artifact_type for {image_name}: {artifact_type}")
@@ -413,6 +596,78 @@ def verify_artifact_type(
         artifact_type=artifact_type,
     )
     return True
+
+
+def validate_sensor_download_complete(
+    selected: list[dict[str, Any]],
+    *,
+    xdr_root: Path,
+    version: str,
+    log_path: Path | None,
+    dry_run: bool,
+) -> bool:
+    resolved_version = str(version or (selected[0].get("version", "") if selected else ""))
+    sensor_dir = xdr_root / "images" / "sensor" / resolved_version
+    script_path = sensor_dir / "virt_deploy_modular_ds.sh"
+    qcow2_paths = sorted(sensor_dir.glob("*.qcow2")) if sensor_dir.is_dir() else []
+    manifest_targets: list[str] = []
+    for im in selected:
+        try:
+            manifest_targets.append(str(under_xdr_root(xdr_root, str(im["output_path"]))))
+        except Exception:
+            manifest_targets.append(str(im.get("output_path", "")))
+    log_jsonl(
+        log_path,
+        "stellar_sensor_download_hard_validation_started",
+        resolved_version=resolved_version,
+        target_dir=str(sensor_dir),
+        required_script=str(script_path),
+        qcow2_glob=str(sensor_dir / "*.qcow2"),
+        manifest_targets=manifest_targets,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        log_jsonl(
+            log_path,
+            "stellar_sensor_download_hard_validation_result",
+            resolved_version=resolved_version,
+            target_dir=str(sensor_dir),
+            validation_result="dry_run",
+        )
+        return True
+
+    ok = True
+    if not script_path.is_file():
+        ok = False
+        print(f"ERROR: Stellar sensor deploy script missing: {script_path}", file=sys.stderr)
+    elif not os.access(script_path, os.X_OK):
+        ok = False
+        print(f"ERROR: Stellar sensor deploy script is not executable: {script_path}", file=sys.stderr)
+    if not qcow2_paths:
+        ok = False
+        print(f"ERROR: Stellar sensor qcow2 missing: {sensor_dir}/*.qcow2", file=sys.stderr)
+    else:
+        for qcow2 in qcow2_paths:
+            if not verify_qcow2_image(qcow2, image_name="stellar_sensor_hard_validation", log_path=log_path):
+                ok = False
+
+    log_jsonl(
+        log_path,
+        "stellar_sensor_download_hard_validation_result",
+        resolved_version=resolved_version,
+        target_dir=str(sensor_dir),
+        required_script=str(script_path),
+        required_script_exists=script_path.is_file(),
+        required_script_executable=os.access(script_path, os.X_OK),
+        qcow2_paths=[str(p) for p in qcow2_paths],
+        qcow2_count=len(qcow2_paths),
+        validation_result="pass" if ok else "fail",
+    )
+    if ok:
+        print("RESULT: PASS", file=sys.stderr)
+    else:
+        print("RESULT: FAIL", file=sys.stderr)
+    return ok
 
 
 def cmd_download(args: argparse.Namespace) -> int:
@@ -508,6 +763,18 @@ def cmd_download(args: argparse.Namespace) -> int:
                 return 2
             log_jsonl(log_path, "image_download_failed", image=name, reason=str(e), skipped_optional=True)
             continue
+
+        log_jsonl(
+            log_path,
+            "image_download_resolved",
+            image=name,
+            resolved_version=version,
+            resolved_url=url,
+            target_path=str(out_path),
+            target_filename=out_path.name,
+            required=required,
+            compressed=compressed,
+        )
 
         prev = st_images.get(name, {}) if isinstance(st_images.get(name), dict) else {}
         last_checked = utc_now()
@@ -645,6 +912,14 @@ def cmd_download(args: argparse.Namespace) -> int:
 
             if sha and not verify_checksum(dl_path, sha, log_path=log_path, dry_run=dry_run, image_name=name):
                 if required:
+                    log_download_validation(
+                        log_path,
+                        "image_download_validation_result",
+                        image=name,
+                        path=dl_path,
+                        validation_result="fail",
+                        reason="checksum",
+                    )
                     return 2
                 log_jsonl(log_path, "image_download_failed", image=name, reason="checksum", skipped_optional=True)
                 continue
@@ -674,10 +949,26 @@ def cmd_download(args: argparse.Namespace) -> int:
                 dry_run=dry_run,
                 image_name=name,
             ):
+                log_download_validation(
+                    log_path,
+                    "image_download_validation_result",
+                    image=name,
+                    path=out_path,
+                    validation_result="fail",
+                    reason="artifact_type",
+                )
                 if required:
                     return 2
                 log_jsonl(log_path, "image_download_failed", image=name, reason="artifact_type", skipped_optional=True)
                 continue
+            log_download_validation(
+                log_path,
+                "image_download_validation_result",
+                image=name,
+                path=out_path,
+                validation_result="pass",
+                artifact_type=artifact_type,
+            )
             write_state(
                 downloaded=True,
                 verified=True,
@@ -690,6 +981,15 @@ def cmd_download(args: argparse.Namespace) -> int:
                 return 2
             log_jsonl(log_path, "image_download_failed", image=name, reason=str(e), skipped_optional=True)
             overall_rc = overall_rc or 0
+
+    if sensor_selected and not validate_sensor_download_complete(
+        sensor_selected,
+        xdr_root=xdr_root,
+        version=str(args.version or (sensor_selected[0].get("version", "") if sensor_selected else "")),
+        log_path=log_path,
+        dry_run=dry_run,
+    ):
+        return 2
 
     return overall_rc
 

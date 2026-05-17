@@ -73,6 +73,7 @@ fi
 : "${XDR_LAB_MIRROR_STATE_JSON:=${STATED}/mirror.json}"
 : "${LAB_BRIDGE:=br0}"
 : "${LAB_OVS_NETWORK:=ovs-net}"
+: "${LAB_OVS_CAPTURE_NETWORK:=${LAB_OVS_NETWORK}}"
 : "${LAB_GATEWAY:=10.10.10.1}"
 : "${XDR_LAB_MIRROR_PROBE_TARGET:=${LAB_GATEWAY}}"
 
@@ -332,15 +333,15 @@ apply_ovs_mirror() {
     return 1
   fi
 
-  # 5. Auto-discover sensor vnet interface (no hard-coding allowed).
+  # 5. Auto-discover the dedicated capture vnet interface (no hard-coding allowed).
   local sensor_iface
   sensor_iface="$(python3 "${MIRROR_HELPER}" discover-iface --vm "${sensor_vm}" --bridge "${bridge}" 2>/dev/null || true)"
   if [[ -z "${sensor_iface}" ]]; then
-    log_structured "ERROR" "ovs_mirror_apply_failed reason=sensor_iface_not_found vm=${sensor_vm} bridge=${bridge}"
+    log_structured "ERROR" "ovs_mirror_apply_failed reason=sensor_capture_iface_not_found vm=${sensor_vm} bridge=${bridge} policy=management_nic_forbidden"
     _mirror_refresh_state "$sensor_vm" "$bridge" "$mirror_name" 0
     return 1
   fi
-  log_structured "INFO" "ovs_mirror_apply_iface_discovered vm=${sensor_vm} bridge=${bridge} iface=${sensor_iface}"
+  log_structured "INFO" "ovs_mirror_apply_capture_iface_discovered vm=${sensor_vm} bridge=${bridge} capture_iface=${sensor_iface}"
 
   # 6. Idempotency: if the live mirror already matches the desired identity,
   #    do NOT recreate — just refresh the state JSON.
@@ -410,12 +411,13 @@ verify_ovs_mirror() {
   fi
 
   _invoke_state_refresh "$sensor_vm" 0
-  local mirror_exists output_port_exists output_port_matches sensor_iface
+  local mirror_exists output_port_exists output_port_matches sensor_iface sensor_mgmt_iface
   mirror_exists="$(_mirror_state_field mirror_exists)"
   output_port_exists="$(_mirror_state_field output_port_exists)"
-  output_port_matches="$(_mirror_state_field output_port_matches_sensor)"
+  output_port_matches="$(_mirror_state_field output_port_matches_capture)"
   sensor_iface="$(_mirror_state_field sensor_interface)"
-  log_structured "WARN" "ovs_mirror_verify_failed sensor_vm=${sensor_vm} bridge=${bridge} mirror=${mirror_name} mirror_exists=${mirror_exists} output_port_exists=${output_port_exists} output_port_matches=${output_port_matches} sensor_iface=${sensor_iface:-unknown}"
+  sensor_mgmt_iface="$(_mirror_state_field sensor_mgmt_interface)"
+  log_structured "WARN" "ovs_mirror_verify_failed sensor_vm=${sensor_vm} bridge=${bridge} mirror=${mirror_name} mirror_exists=${mirror_exists} output_port_exists=${output_port_exists} output_port_matches_capture=${output_port_matches} sensor_mgmt_iface=${sensor_mgmt_iface:-unknown} sensor_capture_iface=${sensor_iface:-unknown}"
   return 1
 }
 
@@ -1022,6 +1024,56 @@ require_positive_int_at_least() {
   fi
 }
 
+sensor_capture_network_for() {
+  local vm="$1"
+  python3 - "$CFG" "$vm" "${LAB_OVS_CAPTURE_NETWORK}" <<'PY'
+import json, sys
+path, vm, default = sys.argv[1:4]
+try:
+    cfg = json.load(open(path, encoding="utf-8"))
+    nics = ((cfg.get("vms") or {}).get(vm) or {}).get("nics") or {}
+    capture = nics.get("capture_nic") or {}
+    print(capture.get("network") or default)
+except Exception:
+    print(default)
+PY
+}
+
+sensor_vnet_count() {
+  local vm="$1"
+  virsh domiflist "${vm}" 2>/dev/null | awk 'NR>2 && $1 ~ /^vnet/ {n++} END {print n+0}'
+}
+
+ensure_sensor_capture_nic() {
+  local vm="$1"
+  local capture_network="${2:-$(sensor_capture_network_for "$vm")}"
+  local count state attach_args=()
+
+  count="$(sensor_vnet_count "$vm")"
+  if [[ "${count}" -ge 2 ]]; then
+    log_structured "INFO" "sensor_capture_nic_present vm=${vm} vnet_count=${count} capture_network=${capture_network}"
+    return 0
+  fi
+
+  if ! virsh net-info "${capture_network}" >/dev/null 2>&1; then
+    die "Sensor capture libvirt network '${capture_network}' is not defined; capture NIC is required and management NIC mirror reuse is unsupported"
+  fi
+
+  state="$(virsh domstate "${vm}" 2>/dev/null | tr -d '\r' || true)"
+  attach_args=(--domain "$vm" --type network --source "$capture_network" --model virtio --config)
+  if [[ "${state}" == "running" ]]; then
+    attach_args+=(--live)
+  fi
+  log_structured "INFO" "sensor_capture_nic_attach vm=${vm} network=${capture_network} state=${state:-unknown}"
+  virsh attach-interface "${attach_args[@]}" >/dev/null
+
+  count="$(sensor_vnet_count "$vm")"
+  if [[ "${count}" -lt 2 ]]; then
+    die "Sensor capture NIC attach did not produce a second vnet interface for ${vm}"
+  fi
+  log_structured "INFO" "sensor_capture_nic_attached vm=${vm} network=${capture_network} vnet_count=${count}"
+}
+
 get_lab_subnet_cidr() {
   python3 - "$CFG" <<'PY'
 import json, sys
@@ -1058,15 +1110,23 @@ validate_stellar_download_env() {
   if [[ -n "${STELLAR_DOWNLOAD_USER:-}" && -n "${STELLAR_DOWNLOAD_PASSWORD:-}" ]]; then
     return 0
   fi
-  [[ -f "${env_file}" ]] || die "Stellar download credentials missing: set STELLAR_DOWNLOAD_USER/STELLAR_DOWNLOAD_PASSWORD or create ${env_file} (chmod 600 recommended)"
-  local mode owner
+  [[ -f "${env_file}" ]] || die "Stellar download credentials missing: set STELLAR_DOWNLOAD_USER/STELLAR_DOWNLOAD_PASSWORD or create ${env_file} (owner root:xdr-lab, mode 0640 recommended)"
+  local mode owner group current_user
   mode="$(stat -c '%a' "${env_file}" 2>/dev/null || echo "")"
   owner="$(stat -c '%U' "${env_file}" 2>/dev/null || echo "")"
+  group="$(stat -c '%G' "${env_file}" 2>/dev/null || echo "")"
+  current_user="$(id -un 2>/dev/null || echo "${USER:-unknown}")"
   if [[ -n "${owner}" && "${owner}" != "root" ]]; then
     log_structured "WARN" "stellar_download_env_owner owner=${owner} path=${env_file} recommendation=root"
   fi
-  if [[ "${mode}" =~ ^[0-7]+$ ]] && (( 8#${mode} & 077 )); then
-    log_structured "WARN" "stellar_download_env_permissions mode=${mode} path=${env_file} recommendation=0600"
+  if [[ -n "${group}" && "${group}" != "xdr-lab" ]]; then
+    log_structured "WARN" "stellar_download_env_group group=${group} path=${env_file} recommendation=xdr-lab"
+  fi
+  if [[ "${mode}" =~ ^[0-7]+$ ]] && [[ "${mode}" != "640" ]]; then
+    log_structured "WARN" "stellar_download_env_permissions mode=${mode} path=${env_file} recommendation=0640"
+  fi
+  if [[ ! -r "${env_file}" ]]; then
+    die "Stellar download credentials file exists but is not readable; current_user=${current_user}; credential_file=${env_file}; required_owner_group=root:xdr-lab; required_mode=0640; remediation=Run installer or: sudo chown root:xdr-lab ${env_file} && sudo chmod 640 ${env_file} && newgrp xdr-lab; env_override=export STELLAR_DOWNLOAD_USER/STELLAR_DOWNLOAD_PASSWORD for this command"
   fi
 }
 
@@ -1997,7 +2057,7 @@ deploy_sensor_vm() {
   local nodownload="${2:-0}"
   local version="${3:-$(vm_json_field_optional "$vm" sensor_version "6.2.0")}"
 
-  local sdir script_name qcow2_name ip gw dns mask hostn cpu mem disk_gb installdir bridge
+  local sdir script_name qcow2_name ip gw dns mask hostn cpu mem disk_gb installdir bridge capture_network deploy_image_dir deploy_image_path deploy_script
   sdir="$(sensor_cache_dir_for_version "$version")"
   script_name="$(get_vm_field "$vm" virt_deploy_script_name)"
   qcow2_name="$(vm_json_field_optional "$vm" qcow2_name "aella-modular-ds-${version}.qcow2")"
@@ -2007,10 +2067,13 @@ deploy_sensor_vm() {
   mask="$(net_global_field netmask)"
   hostn="$(get_vm_field "$vm" hostname)"
   bridge="$(vm_json_field_optional "$vm" bridge "${LAB_BRIDGE}")"
+  capture_network="$(sensor_capture_network_for "$vm")"
   cpu="${XDR_LAB_SENSOR_CPUS_OVERRIDE:-$(vm_json_field_optional "$vm" cpu "4")}"
   mem="${XDR_LAB_SENSOR_MEMORY_MB_OVERRIDE:-$(vm_json_field_optional "$vm" memory_mb "$(vm_json_field_optional "$vm" memory "6144")")}"
   disk_gb="${XDR_LAB_SENSOR_DISK_GB_OVERRIDE:-$(vm_json_field_optional "$vm" disk_size_gb "80")}"
   installdir="$(vm_json_field_optional "$vm" installdir "/var/lib/libvirt/images/${vm}")"
+  deploy_image_dir="${installdir}/images"
+  deploy_image_path="${deploy_image_dir}/${qcow2_name}"
 
   require_positive_int_at_least "--cpus" "$cpu" 4
   require_positive_int_at_least "--memory-mb" "$mem" 6144
@@ -2028,6 +2091,7 @@ deploy_sensor_vm() {
     "--DISKSIZE=${disk_gb}"
     "--installdir=${installdir}"
     "--nodownload=true"
+    "--nointeract=true"
     "--bridge=${bridge}"
     "--ip=${ip}"
     "--netmask=${mask}"
@@ -2039,16 +2103,45 @@ deploy_sensor_vm() {
     printf 'DRY-RUN: cd %q && bash %q' "$sdir" "${script_name}"
     printf ' %q' "${args[@]}"
     printf '\n'
-    log_structured "INFO" "dry_run sensor_deploy_command vm=${vm} version=${version} cpus=${cpu} memory_mb=${mem} disk_gb=${disk_gb}"
+    printf 'DRY-RUN: virsh attach-interface --domain %q --type network --source %q --model virtio --config --live\n' "$vm" "${capture_network}"
+    log_structured "INFO" "dry_run sensor_deploy_command vm=${vm} version=${version} cpus=${cpu} memory_mb=${mem} disk_gb=${disk_gb} capture_network=${capture_network}"
     return 0
   fi
 
   require_cmd virsh
   require_cmd bash
+  require_cmd python3
+  mkdir -p "${deploy_image_dir}"
+  ln -sfn "${sdir}/${qcow2_name}" "${deploy_image_path}"
+  log_structured "INFO" "sensor_deploy_image_prepared vm=${vm} source=${sdir}/${qcow2_name} target=${deploy_image_path}"
+  deploy_script="${sdir}/${script_name}.xdr-lab"
+  python3 - "${sdir}/${script_name}" "${deploy_script}" "${LAB_OVS_NETWORK}" <<'PY'
+import sys
+src, dst, net = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(src, encoding="utf-8").read()
+needle = "bridge=${BRIDGE},model=virtio"
+replacement = f"network={net},model=virtio"
+if needle not in text:
+    raise SystemExit(f"Stellar deploy script network anchor not found: {needle}")
+text = text.replace(needle, replacement)
+open(dst, "w", encoding="utf-8").write(text)
+PY
+  chmod +x "${deploy_script}"
+  log_structured "INFO" "sensor_deploy_script_patched vm=${vm} script=${deploy_script} libvirt_network=${LAB_OVS_NETWORK}"
+  if vm_exists "${vm}"; then
+    log_structured "WARN" "sensor_deploy_existing_domain_cleanup vm=${vm}"
+    virsh autostart "${vm}" --disable >/dev/null 2>&1 || true
+    virsh destroy "${vm}" >/dev/null 2>&1 || true
+    virsh undefine "${vm}" --managed-save --snapshots-metadata --remove-all-storage >/dev/null 2>&1 || \
+      virsh undefine "${vm}" --managed-save --snapshots-metadata >/dev/null 2>&1 || \
+      virsh undefine "${vm}" >/dev/null 2>&1 || true
+  fi
 
-  # Sensor traffic collection stays on the existing OVS mirror path; no SPAN or br0-span flag is passed.
-  log_structured "INFO" "deploy_sensor_vm_exec vm=${vm} bridge=${bridge} nodownload=${nodownload} cpus=${cpu} memory_mb=${mem} disk_gb=${disk_gb} version=${version}"
-  ( cd "$sdir" && bash "./${script_name}" "${args[@]}" )
+  # Official sensor model: vendor deploy creates NIC #1 for management;
+  # xdr-lab attaches NIC #2 as the IP-less capture sink for OVS mirror output.
+  log_structured "INFO" "deploy_sensor_vm_exec vm=${vm} bridge=${bridge} capture_network=${capture_network} nodownload=${nodownload} cpus=${cpu} memory_mb=${mem} disk_gb=${disk_gb} version=${version}"
+  ( cd "$sdir" && bash "./$(basename "${deploy_script}")" "${args[@]}" )
+  ensure_sensor_capture_nic "$vm" "${capture_network}"
 
   validate_sensor_deployment "$vm" "$ip" "$hostn"
   _invoke_state_refresh "$vm" 1
@@ -2059,6 +2152,13 @@ validate_sensor_deployment() {
   if vm_exists "$vm"; then
     log_structured "INFO" "validate_sensor_deployment virsh_ok vm=${vm}"
     validate_vm_libvirt_network_attach "$vm" || true
+    local vnet_count
+    vnet_count="$(sensor_vnet_count "$vm")"
+    if [[ "${vnet_count}" -lt 2 ]]; then
+      log_structured "ERROR" "validate_sensor_deployment_capture_nic_missing vm=${vm} vnet_count=${vnet_count}"
+      return 1
+    fi
+    log_structured "INFO" "validate_sensor_deployment_dual_nic_ok vm=${vm} vnet_count=${vnet_count}"
   else
     log_structured "WARN" "validate_sensor_deployment virsh_missing vm=${vm}"
   fi

@@ -466,6 +466,35 @@ def derive_mirror_applied(
     return bool(rec.get("consistent", False))
 
 
+def sensor_capture_runtime(
+    *,
+    vm: str,
+    state_dir: Path,
+    exists: bool,
+) -> dict[str, Any]:
+    if vm != "sensor-vm":
+        return {}
+    mirror = load_json_dict(state_dir / "mirror.json")
+    return {
+        "sensor_mgmt_interface": mirror.get("sensor_mgmt_interface"),
+        "sensor_capture_interface": mirror.get("sensor_capture_interface"),
+        "sensor_capture_nic_present": bool(mirror.get("sensor_capture_interface")) if exists else False,
+        "sensor_capture_nic_mirror_target": bool(
+            mirror.get("mirror_bound_to_capture_interface")
+            or mirror.get("output_port_matches_capture")
+        ),
+        "mgmt_capture_separation_valid": bool(
+            mirror.get("sensor_mgmt_interface")
+            and mirror.get("sensor_capture_interface")
+            and mirror.get("sensor_mgmt_interface") != mirror.get("sensor_capture_interface")
+            and (
+                mirror.get("mirror_bound_to_capture_interface")
+                or mirror.get("output_port_matches_capture")
+            )
+        ),
+    }
+
+
 def last_deploy_preserve(prev: dict[str, Any], touch_deploy: bool) -> str | None:
     if touch_deploy:
         return utc_now()
@@ -549,6 +578,8 @@ def build_state(
         "image_source": img_src,
         "deployment_type": d_type,
     }
+
+    out.update(sensor_capture_runtime(vm=vm, state_dir=state_dir, exists=exists))
 
     if vtype == "windows":
         xml_txt = virsh_dumpxml(vm) if exists else ""

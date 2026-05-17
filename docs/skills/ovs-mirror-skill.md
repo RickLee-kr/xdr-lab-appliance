@@ -24,6 +24,9 @@ Read this **before** writing `xdr-lab-ovs-manager.sh` or invoking
   extends scope.
 - **Never delete a mirror by clearing the bridge's mirror set.**
   Always target the named mirror object directly.
+- **Never use the sensor management NIC as mirror output.** Stellar Sensor
+  MUST use a dedicated capture interface; management NIC mirror reuse is
+  deprecated, unsupported, and dev-only legacy.
 
 ## Mirror operations MUST be incremental and named
 
@@ -54,14 +57,14 @@ Auto-detection is mandatory (spec 007 §5):
 
 1. Look up the sensor VM name from `lab-vms.json` (today
    `sensor-vm`).
-2. Resolve its host-side tap interface via `virsh domiflist
+2. Resolve its host-side management and capture taps via `virsh domiflist
    <sensor>` filtered to ports on the lab OVS bridge.
-3. If the sensor's interface cannot be resolved → `die "sensor
-   mirror destination unresolved"`. Do NOT pick a default like
-   `vnet0`.
-4. Log the discovered iface
-   (`mirror_port_discovered vm=sensor-vm iface=…`).
-5. Use the discovered interface as the mirror's `output-port`.
+3. Require two sensor taps: NIC #1 management, NIC #2 capture. If capture
+   cannot be resolved → `die "sensor capture mirror destination unresolved"`.
+   Do NOT pick a default like `vnet0`.
+4. Log the discovered interfaces
+   (`sensor_mgmt_interface=… sensor_capture_interface=…`).
+5. Use the discovered capture interface as the mirror's `output-port`.
 
 The sensor MUST NOT appear in `select-src-port` or
 `select-dst-port`. The sensor receives mirrored traffic; it does
@@ -73,7 +76,8 @@ not originate it for the mirror's purposes.
 
 - Confirm the lab's OVS bridge exists.
 - Confirm the named mirror exists on that bridge.
-- Confirm `output_port` is exactly the sensor's discovered iface.
+- Confirm `output_port` is exactly the sensor's discovered capture iface.
+- Fail if `output_port` is the sensor's management iface.
 - Confirm `select_src_port` set equals the discovered lab-VM
   ifaces in scope (no extras, no omissions).
 - Emit `mirror_verify_ok` or `mirror_verify_failed details=…`.
@@ -81,7 +85,7 @@ not originate it for the mirror's purposes.
 ## Recovery patterns
 
 - **Mirror missing → `mirror apply`.** Scoped, idempotent.
-- **Sensor interface changed → re-run `mirror apply`.** Auto-
+- **Sensor capture interface changed → re-run `mirror apply`.** Auto-
   detection picks up the new iface.
 - **Stray source port left after a VM was removed →
   `mirror apply` reconciles** when the implementation derives the set from
@@ -95,7 +99,7 @@ not originate it for the mirror's purposes.
   teardown of the **named** mirror object, then `mirror apply`.
   `emer-reset` is forbidden by constitution P-3.
 - **…hard-code `vnet0` as the sensor:** stop. Use auto-detection
-  via `virsh domiflist`.
+  via `virsh domiflist`, and bind only the capture NIC.
 - **…delete and recreate the OVS bridge to "force a clean
   state":** stop. The bridge is operator-owned; only the named
   mirror object is lab-owned.

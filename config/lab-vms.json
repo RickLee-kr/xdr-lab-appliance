@@ -34,6 +34,30 @@
       "sensor_cache_dir": "images/sensor/6.2.0",
       "virt_deploy_script_name": "virt_deploy_modular_ds.sh",
       "qcow2_name": "aella-modular-ds-6.2.0.qcow2",
+      "nics": {
+        "mgmt_nic": {
+          "role": "management",
+          "network": "ovs-net",
+          "bridge": "br0",
+          "static_ip": "10.10.10.10",
+          "ssh_enabled": true,
+          "reverse_nat": {
+            "ssh": {
+              "external_port": 1022,
+              "internal_port": 22
+            }
+          },
+          "mirror_target": false
+        },
+        "capture_nic": {
+          "role": "capture",
+          "network": "ovs-net",
+          "ip": null,
+          "gateway": null,
+          "management_traffic": false,
+          "mirror_target": true
+        }
+      },
       "minimums": {
         "cpu": 4,
         "memory_mb": 6144,

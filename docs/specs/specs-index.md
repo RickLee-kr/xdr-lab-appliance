@@ -71,10 +71,10 @@ numbered specifications:
 | 001 | Core Architecture         | Layering: CLI / runtime / image / config / network / logging  | Adopted  |
 | 002 | KVM Runtime               | `virsh` / `virt-install` / `qemu-img` lifecycle                | Adopted  |
 | 003 | VM Image Policy           | External download, caching, verification, versioning           | Adopted  |
-| 004 | Sensor Deployment         | Sensor VM as a special deploy type via modular script          | Adopted  |
+| 004 | Sensor Deployment         | Stellar sensor dual-NIC deploy via modular script              | Adopted  |
 | 005 | CLI Extension Policy      | How new `aella_cli` subcommands MUST be added                  | Adopted  |
 | 006 | Network Architecture      | `br0`, `10.10.10.0/24`, NAT, reverse-NAT plane                 | Adopted  |
-| 007 | OVS Mirror Policy         | Non-destructive mirror of internal traffic to sensor port      | Adopted  |
+| 007 | OVS Mirror Policy         | Non-destructive mirror to sensor dedicated capture port        | Adopted  |
 | 008 | Scenario Framework        | BAS / Caldera / Atomic Red Team / Sliver / Mythic extensions   | Reserved |
 | 009 | Snapshot Runtime          | Snapshot/revert lifecycle for replayable scenarios             | Reserved |
 | 010 | Reverse NAT Policy        | iptables-based reverse NAT, lab-owned chain only               | Adopted  |

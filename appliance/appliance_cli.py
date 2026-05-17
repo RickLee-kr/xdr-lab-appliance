@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import grp
 import shlex
 import subprocess
 import sys
@@ -165,8 +166,9 @@ VM names include: sensor-vm, windows-victim, victim-linux, test-vm1 (or 'all' wh
 
 --dry-run prints the manager command line without executing it.
 --nodownload applies to deploy (skip manifest sync + legacy artifact downloads where applicable).
-sensor-vm is Stellar Cyber Modular Data Sensor only; size overrides enforce minimums: --cpus >= 4, --memory-mb >= 6144, --disk-gb >= 80.
-Stellar download credentials must be in /etc/xdr-lab/stellar-download.env with root-only permissions.
+sensor-vm is Stellar Cyber Modular Data Sensor only; deploy creates NIC #1 management (10.10.10.10) plus NIC #2 dedicated IP-less capture for OVS mirror output. Management NIC mirror reuse is unsupported.
+Size overrides enforce minimums: --cpus >= 4, --memory-mb >= 6144, --disk-gb >= 80.
+Stellar download credentials must be in /etc/xdr-lab/stellar-download.env with owner root:xdr-lab and mode 0640.
 Manifest-driven golden images are opt-in: enabled in config/images-manifest.json or XDR_LAB_USE_IMAGE_MANIFEST=1.
 """
 
@@ -344,6 +346,11 @@ def _failure_class(rc: int, err: str) -> str:
     text = (err or "").lower()
     if rc == 0:
         return "ok"
+    if (
+        "stellar download credentials" in text
+        and ("not readable" in text or "permission" in text)
+    ):
+        return "permission_denied"
     if "permission denied" in text or "operation not permitted" in text or "sudo" in text:
         if "ovs" in text or "ovsdb" in text:
             return "ovs_privilege"
@@ -381,6 +388,33 @@ def _lab_failure_notice(argv: List[str], rc: int, err: str = "") -> None:
         f"Error: lab command failed (exit {rc}). "
         f"FAILURE_CLASS={klass}. Review stderr above or check {script} logs (vm-manager.log).\n"
     )
+    if klass == "permission_denied" and "stellar download credentials" in (err or "").lower():
+        cred_path = os.environ.get("XDR_LAB_STELLAR_DOWNLOAD_ENV", "/etc/xdr-lab/stellar-download.env")
+        sys.stderr.write(
+            "Stellar credential remediation: run the installer or normalize access with "
+            f"`sudo chown root:xdr-lab {cred_path} && sudo chmod 640 {cred_path}`, "
+            "then refresh group membership with `newgrp xdr-lab` or re-login. "
+            "Environment variables STELLAR_DOWNLOAD_USER/STELLAR_DOWNLOAD_PASSWORD still take precedence.\n"
+        )
+
+
+def _path_owner_group_mode(path: Path) -> Tuple[str, str, str]:
+    try:
+        st = path.stat()
+    except OSError:
+        return "-", "-", "-"
+    try:
+        owner = str(st.st_uid)
+        import pwd
+
+        owner = pwd.getpwuid(st.st_uid).pw_name
+    except (KeyError, OSError):
+        owner = str(st.st_uid)
+    try:
+        group = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        group = str(st.st_gid)
+    return owner, group, f"{st.st_mode & 0o777:04o}"
 
 
 def _lab_invoke_script(argv_tail: Sequence[str], *, dry_run: bool) -> int:
@@ -781,12 +815,22 @@ def lab_debug_callback(argv: List[str], *, dry_run: bool) -> int:
     active_config = LAB_CONFIG
     active_state = active_runtime / "runtime" / "state"
     source_root = _REPO_ROOT
+    stellar_env = Path(os.environ.get("XDR_LAB_STELLAR_DOWNLOAD_ENV", "/etc/xdr-lab/stellar-download.env"))
     print(f"active_script_path={active_script}")
     print(f"active_runtime_path={active_runtime}")
     print(f"active_config_path={active_config}")
     print(f"active_state_path={active_state}")
     print(f"source_dev_path={source_root}")
     print("runtime_prod_path=/opt/xdr-lab")
+    owner, group, mode = _path_owner_group_mode(stellar_env)
+    print(f"stellar_download_env_path={stellar_env}")
+    print(f"stellar_download_env_exists={'true' if stellar_env.is_file() else 'false'}")
+    print(f"stellar_download_env_readable={'true' if os.access(stellar_env, os.R_OK) else 'false'}")
+    print(f"stellar_download_env_owner={owner}")
+    print(f"stellar_download_env_group={group}")
+    print(f"stellar_download_env_mode={mode}")
+    print("stellar_download_env_expected=owner root group xdr-lab mode 0640")
+    print("stellar_download_env_values=redacted")
     mismatch = bool(
         active_script.is_relative_to(source_root)
         or active_config.is_relative_to(source_root)

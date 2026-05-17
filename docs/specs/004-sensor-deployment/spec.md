@@ -15,6 +15,8 @@ different from ordinary lab VMs:
   `aella-modular-ds-<version>.qcow2`.
 - It has a **fixed bridge** (`br0`), a **fixed internal IP**
   (today `10.10.10.10`), and a **fixed hostname**.
+- It MUST have two NICs: NIC #1 is management, NIC #2 is a dedicated
+  IP-less capture/SPAN interface.
 - It does **not** use SPAN/mirror as part of its own deploy;
   mirror configuration is a separate concern (spec 007).
 - Ubuntu cloud-image sensor VMs are deprecated development placeholders
@@ -37,7 +39,10 @@ config (lab-vms.json :: vms.sensor-vm)
   ├─ virt_deploy_script_name = "virt_deploy_modular_ds.sh"
   ├─ image_url          (aella-modular-ds-<version>.qcow2)
   ├─ qcow2_name         = "aella-modular-ds-6.2.0.qcow2"
-  └─ sensor_cache_dir   = "/opt/xdr-lab/images/sensor/6.2.0"
+  ├─ sensor_cache_dir   = "/opt/xdr-lab/images/sensor/6.2.0"
+  └─ nics
+      ├─ mgmt_nic: network=ovs-net, static_ip=10.10.10.10, ssh_enabled=true
+      └─ capture_nic: network=ovs-net, ip=null, gateway=null, mirror_target=true
 
 L3 sensor cache:
   /opt/xdr-lab/images/sensor/6.2.0/
@@ -58,8 +63,12 @@ L2 sensor deploy:
        --memory-mb 6144 \
        --disk-gb 80
 
+  virsh attach-interface --domain sensor-vm \
+       --type network --source ovs-net --model virtio --config --live
+
 Post-deploy validation:
   virsh dominfo sensor-vm   (must succeed; otherwise WARN)
+  virsh domiflist sensor-vm (must show management + capture vnet)
   ping -c1 -W2 10.10.10.10  (best-effort; WARN on failure)
 ```
 
@@ -80,6 +89,9 @@ It MUST contain at minimum:
 - `cpu`, `memory_mb`, `disk_size_gb` with minimums `4`, `6144`,
   and `80`.
 - `external_nat_port_mapping` (spec 010).
+- `nics.mgmt_nic` and `nics.capture_nic`. The capture NIC MUST be
+  dedicated to packet capture, MUST have no IP or gateway, and MUST be
+  the only eligible OVS mirror output-port.
 - `autostart`.
 
 The fixed networking values (`netmask`, `gateway`, `dns`) are read
@@ -131,8 +143,11 @@ Owned by `download_vm_image sensor-vm` (spec 003):
    spec 007.) CLI overrides are allowed only for `sensor-vm` and must
    satisfy `cpus >= 4`, `memory_mb >= 6144`, `disk_gb >= 80`.
 8. `cd "$sensor_cache_dir" && bash "./${script_name}" "${args[@]}"`.
-9. Call `validate_sensor_deployment` (see §3.4).
-10. Reconcile autostart with `apply_autostart sensor-vm`.
+9. Attach NIC #2 with `virsh attach-interface` using the declared
+   capture network. Single-NIC mirror reuse is deprecated, unsupported,
+   and dev-only legacy material.
+10. Call `validate_sensor_deployment` (see §3.4).
+11. Reconcile autostart with `apply_autostart sensor-vm`.
 
 ### 3.4 Post-deploy validation
 
@@ -140,6 +155,8 @@ Owned by `download_vm_image sensor-vm` (spec 003):
 
 - If `virsh dominfo <vm>` succeeds → log
   `validate_sensor_deployment virsh_ok`.
+- The domain MUST have at least two host-side `vnet*` interfaces:
+  first management, second capture.
 - If it fails → log `validate_sensor_deployment virsh_missing`
   (WARN). This is a soft failure: the upstream script may have
   used a different domain name; the operator inspects logs.
@@ -148,7 +165,9 @@ Owned by `download_vm_image sensor-vm` (spec 003):
 - If it fails → log `validate_sensor_deployment_ping_failed`
   (WARN). Sensor may be still booting; not a deploy failure.
 
-Validation is observability, not gating.
+Validation is observability except for the capture NIC invariant:
+management NIC and capture NIC separation is required for sensor
+readiness and mirror policy.
 
 ## 4. Operational Assumptions
 
@@ -195,9 +214,9 @@ time**. Rationale:
   governed by spec 007.
 - Coupling SPAN to sensor deploy makes mirror recovery require a
   sensor redeploy, which is unacceptable.
-- The sensor's interface for receiving mirrored traffic is the
-  same `br0`-attached NIC; OVS mirror (spec 007) delivers the
-  copy without involving the sensor's deploy CLI.
+- The sensor's interface for receiving mirrored traffic is NIC #2,
+  the dedicated capture NIC. The management NIC MUST NOT be used as
+  OVS mirror output.
 - Ubuntu 20.04+/22.04+/24.04 appliance hosts use the OVS mirror
   path only; Linux bridge based SPAN layouts are legacy material.
 
@@ -207,6 +226,8 @@ Implementer rules:
   `virt_deploy_modular_ds.sh`.
 - L2 MUST NOT add SPAN-related arguments to the sensor's argument
   vector.
+- L2 MUST create or verify the dedicated capture NIC after upstream
+  deploy. A single management NIC used for mirror output is unsupported.
 - A future "mirror enable" command (spec 007) configures OVS, not
   the sensor.
 
@@ -220,6 +241,8 @@ Implementer rules:
 - `virsh dominfo` post-validate failure → WARN, **not** fatal.
   The upstream script may have produced a different domain name;
   the operator must reconcile.
+- Capture NIC missing → fatal for readiness and mirror validation;
+  redeploy or attach NIC #2 before applying the mirror.
 - Ping post-validate failure → WARN, **not** fatal. Sensor may
   still be booting.
 
@@ -289,7 +312,7 @@ A sensor-deployment change is valid only if:
 2. `aella_cli lab deploy sensor-vm --nodownload` does NOT touch
    the sensor cache dir and still produces the domain or
    reconciles autostart.
-3. The sensor's NIC is bridged to `br0` and the sensor reaches
+3. The sensor's management NIC is bridged to `br0` and the sensor reaches
    `10.10.10.10` after boot (verified by the post-deploy ping
    WARN/INFO transition).
 4. The sensor deploy script command line contains, in order:
@@ -298,6 +321,9 @@ A sensor-deployment change is valid only if:
    `--dns 10.10.10.1`, `--hostname sensor-vm` — and nothing
    else.
 5. No SPAN flag is ever present.
-6. `validate-appliance.sh` and `scenario run --dry-run` expose only
+6. The capture NIC exists, has no IP/gateway, and is the OVS mirror
+   output-port. `validate-ovs-mirror` MUST fail if mirror output is
+   the management NIC.
+7. `validate-appliance.sh` and `scenario run --dry-run` expose only
    `READY_FOR_STELLAR_SENSOR_SCENARIO` / `READY_FOR_LIVE_SCENARIO`;
    ordinary lab infrastructure readiness is not a sensor readiness label.
