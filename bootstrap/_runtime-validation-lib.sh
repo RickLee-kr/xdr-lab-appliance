@@ -38,8 +38,8 @@ fi
 : "${XDR_LAB_PIP_TIMEOUT_SECS:=600}"
 : "${XDR_LAB_HTTP_PROBE_TIMEOUT_SECS:=8}"
 : "${XDR_LAB_CALDERA_READY_TIMEOUT_SECS:=300}"
-: "${XDR_LAB_CALDERA_READY_POLL_SECS:=5}"
-: "${XDR_LAB_CALDERA_READY_PROGRESS_SECS:=5}"
+: "${XDR_LAB_CALDERA_READY_POLL_SECS:=3}"
+: "${XDR_LAB_CALDERA_READY_PROGRESS_SECS:=3}"
 : "${XDR_LAB_CALDERA_STALE_GRACE_SECS:=90}"
 : "${XDR_LAB_CALDERA_STALE_MIN_ORPHAN_AGE_SECS:=300}"
 # Exit code when a validator skipped root-only probes (not a runtime failure).
@@ -1072,6 +1072,11 @@ rv_caldera_classify_startup_state() {
     return 0
   fi
 
+  if [[ "${active_state}" == "failed" ]] && rv_caldera_stale_grace_active; then
+    echo "STARTING"
+    return 0
+  fi
+
   if [[ "${active_state}" == "failed" ]]; then
     echo "FAILED"
     return 0
@@ -1116,13 +1121,14 @@ rv_caldera_classify_startup_state() {
   echo "FAILED"
 }
 
-# Poll CALDERA until LISTENING + HTTP reachable (302 counts as up). Args: [timeout_secs].
-# Do not pass a URL as $1 — use rv_caldera_wait_api_authenticated for KEY auth readiness.
+# Poll CALDERA until LISTENING + GET /api/agents returns 200. Args: [timeout_secs].
+# Uses the resolved KEY header when available; without a key, only unauthenticated 200 can pass.
 rv_caldera_wait_ready() {
   local timeout_secs="${1:-${XDR_LAB_CALDERA_READY_TIMEOUT_SECS}}"
   local poll_secs="${XDR_LAB_CALDERA_READY_POLL_SECS}"
   local progress_secs="${XDR_LAB_CALDERA_READY_PROGRESS_SECS}"
-  local port base_url started last_progress=0 elapsed state listen_ok http_ok agents_url login_code
+  local port base_url started last_progress=0 elapsed state listen_ok agents_url
+  local api_key auth_hdr api_code api_loc api_ct http_code phase
 
   if [[ "${timeout_secs}" =~ ^https?:// ]]; then
     rv_log WARN "rv_caldera_wait_ready: numeric timeout expected, got URL — using default timeout"
@@ -1135,6 +1141,7 @@ rv_caldera_wait_ready() {
   port="$(rv_caldera_port)"
   base_url="$(rv_caldera_base_url)"
   agents_url="$(rv_url_join_path "${base_url}" "api/agents")"
+  api_key="$(rv_caldera_api_key || true)"
   started="$(date +%s)"
 
   while true; do
@@ -1146,13 +1153,23 @@ rv_caldera_wait_ready() {
 
     state="$(rv_caldera_classify_startup_state)"
     listen_ok=0
-    http_ok=0
+    api_code="000"
+    api_loc=""
+    api_ct=""
     if rv_caldera_port_listening "${port}"; then
       listen_ok=1
+      if [[ -n "${api_key}" ]]; then
+        IFS=$'\t' read -r auth_hdr api_code api_loc api_ct < <(rv_caldera_auth_probe "${base_url}" "${api_key}")
+      else
+        IFS=$'\t' read -r api_code api_loc api_ct < <(rv_caldera_agents_http_meta "${base_url}")
+      fi
+    else
+      http_code="$(rv_caldera_http_probe_code "${base_url}")"
+      [[ -n "${http_code}" ]] && api_code="${http_code}"
     fi
-    login_code="$(rv_caldera_login_http_code "${base_url}")"
-    if [[ "${login_code}" == "200" ]] || rv_caldera_http_ready "${base_url}"; then
-      http_ok=1
+
+    if [[ "${state}" == "FAILED" ]] && rv_caldera_stale_grace_active; then
+      state="STARTING"
     fi
 
     if [[ "${state}" == "FAILED" ]]; then
@@ -1160,12 +1177,15 @@ rv_caldera_wait_ready() {
       return 1
     fi
 
-    if [[ "${http_ok}" -eq 1 ]]; then
-      echo "HTTP READY /login http_code=${login_code} api_probe=${agents_url} (${elapsed}s)"
+    if [[ "${listen_ok}" -eq 1 && "${api_code}" == "200" ]]; then
+      echo "API READY ${agents_url} http_code=200 (${elapsed}s)"
       return 0
     fi
-    if [[ "${listen_ok}" -eq 1 ]]; then
-      phase="LISTENING"
+
+    if [[ "${listen_ok}" -eq 0 && "${api_code}" == "000" ]]; then
+      phase="waiting_for_bind"
+    elif [[ "${listen_ok}" -eq 1 ]]; then
+      phase="waiting_for_api"
     elif [[ "${state}" == "BUILDING" ]]; then
       phase="BUILDING"
     else
@@ -1173,7 +1193,7 @@ rv_caldera_wait_ready() {
     fi
 
     if (( elapsed >= last_progress )); then
-      echo "${phase} elapsed=${elapsed}s port=${port}"
+      echo "${phase} elapsed=${elapsed}s port=${port} http_code=${api_code} location=${api_loc:-none}"
       last_progress=$(( elapsed + progress_secs ))
     fi
 
@@ -1391,6 +1411,63 @@ rv_sensor_vnets_on_bridge() {
 
   echo "No libvirt vnet interface found for ${vm}" >&2
   return 1
+}
+
+rv_domifaddr_iface_has_ip() {
+  local vm="$1" iface="$2" mac="${3:-}" domifaddr_out=""
+  [[ -n "${iface}" || -n "${mac}" ]] || return 1
+  domifaddr_out="$(rv_virsh_system domifaddr "${vm}" 2>/dev/null || true)"
+  if [[ -n "${iface}" ]] && grep -qE "^[[:space:]]*${iface}[[:space:]]" <<<"${domifaddr_out}"; then
+    return 0
+  fi
+  if [[ -n "${mac}" ]] && grep -qiF "${mac}" <<<"${domifaddr_out}"; then
+    return 0
+  fi
+  local sensor_ip neigh_mac
+  sensor_ip="$(python3 - "${XDR_ROOT}/config/lab-vms.json" "${vm}" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    print(cfg.get("vms", {}).get(sys.argv[2], {}).get("internal_ip", "") or "")
+except Exception:
+    print("")
+PY
+)"
+  if [[ -n "${sensor_ip}" && -n "${mac}" ]] && command -v ip &>/dev/null; then
+    neigh_mac="$(ip neigh show "${sensor_ip}" 2>/dev/null | awk '/ lladdr / {for (i=1; i<=NF; i++) if ($i == "lladdr") {print $(i+1); exit}}')"
+    if [[ -n "${neigh_mac}" && "${neigh_mac,,}" == "${mac,,}" ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+rv_sensor_role_vnets_on_bridge() {
+  local vm="$1" bridge="${2:-${LAB_BRIDGE}}"
+  local taps domiflist iface source mac
+  local -a mgmt_candidates=() capture_candidates=()
+  taps="$(rv_sensor_vnets_on_bridge "${vm}" "${bridge}")" || return 1
+  domiflist="$(rv_virsh_system_domiflist "${vm}" 2>/dev/null)" || true
+  while read -r iface; do
+    [[ -n "${iface}" ]] || continue
+    mac="$(awk -v want="${iface}" 'NR>2 && $1 == want {print $5; exit}' <<<"${domiflist}")"
+    if rv_domifaddr_iface_has_ip "${vm}" "${iface}" "${mac}"; then
+      mgmt_candidates+=("${iface}")
+    else
+      capture_candidates+=("${iface}")
+    fi
+  done <<<"${taps}"
+
+  if [[ "${#mgmt_candidates[@]}" -ne 1 || "${#capture_candidates[@]}" -ne 1 ]]; then
+    echo "Unable to classify sensor NIC roles from live facts: management_candidates=${#mgmt_candidates[@]} capture_candidates=${#capture_candidates[@]} (requires exactly one IP-bearing management NIC and one IP-less capture NIC on ${bridge})" >&2
+    return 1
+  fi
+  if [[ "${mgmt_candidates[0]}" == "${capture_candidates[0]}" ]]; then
+    echo "Management and capture NIC resolved to the same interface; management NIC MUST NOT be mirror output" >&2
+    return 1
+  fi
+  printf '%s\n%s\n' "${mgmt_candidates[0]}" "${capture_candidates[0]}"
 }
 
 # Legacy helper: first sensor tap is the management NIC.

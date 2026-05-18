@@ -118,7 +118,7 @@ sensor_capture_iface=""
 sensor_rc=0
 sensor_vnet_out=""
 set +e
-sensor_vnet_out="$(rv_sensor_vnets_on_bridge "${SENSOR_VM}" "${LAB_BRIDGE}" 2>&1)"
+sensor_vnet_out="$(rv_sensor_role_vnets_on_bridge "${SENSOR_VM}" "${LAB_BRIDGE}" 2>&1)"
 sensor_rc=$?
 set -e
 if [[ "${sensor_rc}" -eq 0 && -n "${sensor_vnet_out}" ]]; then

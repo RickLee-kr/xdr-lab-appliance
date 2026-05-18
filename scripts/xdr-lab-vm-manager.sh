@@ -59,6 +59,7 @@ readonly NAT_HELPER="$(_xdr_helper_path nat_state.py)"
 readonly SNAPSHOT_HELPER="$(_xdr_helper_path snapshot_state.py)"
 readonly IMAGE_DL_HELPER="$(_xdr_helper_path image_download_manager.py)"
 readonly CALDERA_HELPER="$(_xdr_helper_path caldera_orchestration.py)"
+readonly TOOL_HELPER="$(_xdr_helper_path tool_runtime_manager.py)"
 if [[ "${XDR_LAB_DEV_MODE}" == "1" && -f "${_XDR_VM_MGR_DIR}/windows_lab_helpers.sh" ]]; then
   # shellcheck source=windows_lab_helpers.sh
   . "${_XDR_VM_MGR_DIR}/windows_lab_helpers.sh"
@@ -214,7 +215,7 @@ _invoke_state_refresh() {
 }
 
 # =============================================================================
-# OVS mirror orchestration — state-aware (mirror.json is the source of truth).
+# OVS mirror orchestration — state-aware (mirror.json is a refreshed cache).
 #
 # Mutations (ovs-vsctl) live in apply_ovs_mirror; verify/validate are read-only.
 # All three respect XDR_LAB_DRY_RUN=1 and emit JSONL events to vm-manager.log.
@@ -269,10 +270,13 @@ PY
 
 _mirror_refresh_state() {
   local sensor_vm="$1" bridge="$2" mirror_name="$3" touch_applied="${4:-0}"
+  local management_ip
+  management_ip="$(_mirror_get_sensor_ip "$sensor_vm")"
   local args=(refresh
     --bridge "$bridge"
     --mirror-name "$mirror_name"
     --sensor-vm "$sensor_vm"
+    --management-ip "$management_ip"
     --state-path "${XDR_LAB_MIRROR_STATE_JSON}"
   )
   if [[ "$touch_applied" == "1" ]]; then
@@ -282,6 +286,93 @@ _mirror_refresh_state() {
   python3 "${MIRROR_HELPER}" "${args[@]}" >/dev/null || true
   # Cascade: sensor-vm.json mirror_applied is derived from mirror.json.
   _invoke_state_refresh "$sensor_vm" 0
+}
+
+_mirror_quote_cmd() {
+  printf '%q ' "$@"
+  printf '\n'
+}
+
+_mirror_inspect_json() {
+  local sensor_vm="$1" bridge="$2" mirror_name="$3"
+  local management_ip
+  management_ip="$(_mirror_get_sensor_ip "$sensor_vm")"
+  python3 "${MIRROR_HELPER}" inspect \
+    --bridge "${bridge}" \
+    --mirror-name "${mirror_name}" \
+    --sensor-vm "${sensor_vm}" \
+    --management-ip "${management_ip}" 2>/dev/null || true
+}
+
+_mirror_print_diagnostics_json() {
+  local json="$1"
+  python3 - "$json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    doc = json.loads(sys.argv[1] or "{}")
+except Exception:
+    doc = {}
+print("sensor-vm interfaces:")
+topology = doc.get("sensor_topology") if isinstance(doc.get("sensor_topology"), list) else []
+if topology:
+    for row in topology:
+        iface = row.get("interface") or "unknown"
+        role = row.get("detected_role") or "unknown"
+        source = row.get("source") or "unknown"
+        has_ip = str(bool(row.get("has_ip"))).lower()
+        attached = str(bool(row.get("attached_to_bridge"))).lower()
+        print(f"  {iface} -> {role} source={source} attached_to_bridge={attached} has_ip={has_ip}")
+else:
+    print("  (none detected)")
+print(f"selected_capture_port={doc.get('detected_capture_port') or doc.get('sensor_capture_interface') or 'unknown'}")
+print(f"detected_bridge={doc.get('detected_bridge') or doc.get('bridge') or 'unknown'}")
+print(f"detected_mirror_port={doc.get('output_port_name') or 'unknown'}")
+print(f"current_mirrors={doc.get('current_mirrors') or '[]'}")
+reasons = doc.get("verify_failure_reasons") if isinstance(doc.get("verify_failure_reasons"), list) else []
+if reasons:
+    print("verify_failure_reasons:")
+    for reason in reasons:
+        print(f"  - {reason}")
+PY
+}
+
+_mirror_print_state_diagnostics() {
+  if [[ ! -f "${XDR_LAB_MIRROR_STATE_JSON}" ]]; then
+    echo "mirror diagnostics: ${XDR_LAB_MIRROR_STATE_JSON} missing"
+    return 0
+  fi
+  python3 - "${XDR_LAB_MIRROR_STATE_JSON}" <<'PY' 2>/dev/null || true
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+except Exception as exc:
+    print(f"mirror diagnostics unavailable: {exc}")
+    sys.exit(0)
+print("=== OVS mirror live source-of-truth ===")
+print("$ virsh domiflist " + str(doc.get("sensor_vm") or "sensor-vm"))
+print(doc.get("domiflist") or "(empty)")
+print("")
+print("$ ovs-vsctl show")
+print(doc.get("ovs_show") or "(empty)")
+print("")
+print(f"detected_bridge={doc.get('detected_bridge') or doc.get('bridge') or 'unknown'}")
+print(f"detected_capture_port={doc.get('detected_capture_port') or 'unknown'}")
+print(f"detected_mirror_port={doc.get('output_port_name') or 'unknown'}")
+print(f"current_mirrors={doc.get('current_mirrors') or '[]'}")
+reasons = doc.get("verify_failure_reasons") if isinstance(doc.get("verify_failure_reasons"), list) else []
+if reasons:
+    print("verify_failure_reasons:")
+    for reason in reasons:
+        print(f"  - {reason}")
+PY
+}
+
+_mirror_refresh_and_print_diagnostics() {
+  local sensor_vm="$1" bridge="$2" mirror_name="$3" touch_applied="${4:-0}"
+  _mirror_refresh_state "$sensor_vm" "$bridge" "$mirror_name" "$touch_applied"
+  _mirror_print_state_diagnostics
 }
 
 apply_ovs_mirror() {
@@ -303,24 +394,49 @@ apply_ovs_mirror() {
   require_cmd ovs-vsctl
   require_cmd virsh
 
+  echo "=== OVS mirror apply diagnostics ==="
+  local inspect_json
+  inspect_json="$(_mirror_inspect_json "$sensor_vm" "$bridge" "$mirror_name")"
+  _mirror_print_diagnostics_json "$inspect_json"
+
   # 1. ovs daemon health.
-  if ! ovs-vsctl show >/dev/null 2>&1; then
-    log_structured "ERROR" "ovs_mirror_apply_failed reason=ovs_not_running"
-    _mirror_refresh_state "$sensor_vm" "$bridge" "$mirror_name" 0
+  local ovs_show_err ovs_show_rc
+  set +e
+  ovs_show_err="$(ovs-vsctl show 2>&1 >/dev/null)"
+  ovs_show_rc=$?
+  set -e
+  if [[ "${ovs_show_rc}" -ne 0 ]]; then
+    echo "ovs-vsctl command: ovs-vsctl show"
+    echo "ovs-vsctl stderr: ${ovs_show_err:-"(empty)"}"
+    log_structured "ERROR" "ovs_mirror_apply_failed reason=ovs_not_running stderr=${ovs_show_err:-empty}"
+    _mirror_refresh_and_print_diagnostics "$sensor_vm" "$bridge" "$mirror_name" 0
     return 1
   fi
+  echo "ovs-vsctl command: ovs-vsctl show"
+  echo "ovs-vsctl success: OVS is reachable"
 
   # 2. bridge presence.
-  if ! ovs-vsctl br-exists "${bridge}" 2>/dev/null; then
-    log_structured "ERROR" "ovs_mirror_apply_failed reason=bridge_missing bridge=${bridge}"
-    _mirror_refresh_state "$sensor_vm" "$bridge" "$mirror_name" 0
+  local br_err br_rc
+  set +e
+  br_err="$(ovs-vsctl br-exists "${bridge}" 2>&1 >/dev/null)"
+  br_rc=$?
+  set -e
+  if [[ "${br_rc}" -ne 0 ]]; then
+    echo "ovs-vsctl command: ovs-vsctl br-exists ${bridge}"
+    echo "ovs-vsctl stderr: ${br_err:-"(empty)"}"
+    log_structured "ERROR" "ovs_mirror_apply_failed reason=bridge_missing bridge=${bridge} stderr=${br_err:-empty}"
+    _mirror_refresh_and_print_diagnostics "$sensor_vm" "$bridge" "$mirror_name" 0
     return 1
   fi
+  echo "ovs-vsctl command: ovs-vsctl br-exists ${bridge}"
+  echo "ovs-vsctl success: bridge ${bridge} exists"
 
   # 3. sensor-vm libvirt domain.
   if ! vm_exists "${sensor_vm}"; then
+    echo "verify_failure_reasons:"
+    echo "  - sensor VM ${sensor_vm} is not defined"
     log_structured "ERROR" "ovs_mirror_apply_failed reason=sensor_vm_not_defined vm=${sensor_vm}"
-    _mirror_refresh_state "$sensor_vm" "$bridge" "$mirror_name" 0
+    _mirror_refresh_and_print_diagnostics "$sensor_vm" "$bridge" "$mirror_name" 0
     return 1
   fi
 
@@ -328,36 +444,43 @@ apply_ovs_mirror() {
   local dom_state
   dom_state="$(virsh domstate "${sensor_vm}" 2>/dev/null | tr -d '\r' || true)"
   if [[ "${dom_state}" != "running" ]]; then
+    echo "verify_failure_reasons:"
+    echo "  - sensor VM ${sensor_vm} is not running (state=${dom_state:-unknown})"
     log_structured "ERROR" "ovs_mirror_apply_failed reason=sensor_vm_not_running vm=${sensor_vm} state=${dom_state:-unknown}"
-    _mirror_refresh_state "$sensor_vm" "$bridge" "$mirror_name" 0
+    _mirror_refresh_and_print_diagnostics "$sensor_vm" "$bridge" "$mirror_name" 0
     return 1
   fi
 
-  # 5. Auto-discover the dedicated capture vnet interface (no hard-coding allowed).
+  # 5. Auto-discover the dedicated capture vnet interface from live NIC facts.
   local sensor_iface
-  sensor_iface="$(python3 "${MIRROR_HELPER}" discover-iface --vm "${sensor_vm}" --bridge "${bridge}" 2>/dev/null || true)"
+  sensor_iface="$(python3 "${MIRROR_HELPER}" discover-iface --vm "${sensor_vm}" --bridge "${bridge}" --management-ip "$(_mirror_get_sensor_ip "$sensor_vm")" 2>/dev/null || true)"
   if [[ -z "${sensor_iface}" ]]; then
     log_structured "ERROR" "ovs_mirror_apply_failed reason=sensor_capture_iface_not_found vm=${sensor_vm} bridge=${bridge} policy=management_nic_forbidden"
-    _mirror_refresh_state "$sensor_vm" "$bridge" "$mirror_name" 0
+    _mirror_refresh_and_print_diagnostics "$sensor_vm" "$bridge" "$mirror_name" 0
     return 1
   fi
+  echo "selected_capture_port=${sensor_iface}"
   log_structured "INFO" "ovs_mirror_apply_capture_iface_discovered vm=${sensor_vm} bridge=${bridge} capture_iface=${sensor_iface}"
 
-  # 6. Idempotency: if the live mirror already matches the desired identity,
-  #    do NOT recreate — just refresh the state JSON.
-  if python3 "${MIRROR_HELPER}" inspect \
-      --bridge "${bridge}" \
-      --mirror-name "${mirror_name}" \
-      --sensor-vm "${sensor_vm}" >/dev/null 2>&1; then
-    log_structured "INFO" "ovs_mirror_apply_idempotent_noop sensor_vm=${sensor_vm} bridge=${bridge} mirror=${mirror_name} iface=${sensor_iface}"
-    _mirror_refresh_state "$sensor_vm" "$bridge" "$mirror_name" 1
-    log_structured "INFO" "ovs_mirror_apply_success sensor_vm=${sensor_vm} bridge=${bridge} mirror=${mirror_name} iface=${sensor_iface} idempotent=true"
-    return 0
+  # 6. Clear stale bridge mirror references before recreating the lab mirror.
+  local clear_cmd=(ovs-vsctl clear bridge "${bridge}" mirrors)
+  echo "ovs-vsctl command: $(_mirror_quote_cmd "${clear_cmd[@]}")"
+  local clear_err clear_rc
+  set +e
+  clear_err="$("${clear_cmd[@]}" 2>&1 >/dev/null)"
+  clear_rc=$?
+  set -e
+  if [[ "${clear_rc}" -ne 0 ]]; then
+    echo "ovs-vsctl stderr: ${clear_err:-"(empty)"}"
+    log_structured "ERROR" "ovs_mirror_apply_failed reason=ovs_vsctl_clear_failed bridge=${bridge} mirror=${mirror_name} stderr=${clear_err:-empty}"
+    _mirror_refresh_and_print_diagnostics "$sensor_vm" "$bridge" "$mirror_name" 0
+    return 1
   fi
+  echo "ovs-vsctl success: cleared stale mirrors on ${bridge}"
 
   # 7. Remove any pre-existing mirror entry with our name (only ours).
   local existing_uuid
-  existing_uuid="$(ovs-vsctl --columns=_uuid --bare find mirror "name=${mirror_name}" 2>/dev/null | head -n1 || true)"
+  existing_uuid="$(ovs-vsctl --columns=_uuid --bare find mirror "name=${mirror_name}" 2>/dev/null | awk 'NF {print; exit}' || true)"
   if [[ -n "${existing_uuid}" ]]; then
     log_structured "INFO" "ovs_mirror_apply_removing_existing mirror=${mirror_name} uuid=${existing_uuid}"
     ovs-vsctl --if-exists remove bridge "${bridge}" mirrors "${existing_uuid}" >/dev/null 2>&1 || true
@@ -367,26 +490,37 @@ apply_ovs_mirror() {
   # 8. Create the new mirror: select_all=true means every packet on the
   #    bridge gets copied to output-port (OVS auto-excludes the output port
   #    itself to prevent feedback loops).
-  if ! ovs-vsctl \
-      -- --id=@out get port "${sensor_iface}" \
-      -- --id=@m create mirror "name=${mirror_name}" select_all=true output-port=@out \
-      -- set bridge "${bridge}" mirrors=@m >/dev/null 2>&1; then
-    log_structured "ERROR" "ovs_mirror_apply_failed reason=ovs_vsctl_create_failed bridge=${bridge} mirror=${mirror_name} iface=${sensor_iface}"
-    _mirror_refresh_state "$sensor_vm" "$bridge" "$mirror_name" 0
+  local create_cmd=(ovs-vsctl
+    -- --id=@out get port "${sensor_iface}"
+    -- --id=@m create mirror "name=${mirror_name}" select_all=true output-port=@out
+    -- set bridge "${bridge}" mirrors=@m
+  )
+  echo "ovs-vsctl command: $(_mirror_quote_cmd "${create_cmd[@]}")"
+  local create_err create_rc
+  set +e
+  create_err="$("${create_cmd[@]}" 2>&1 >/dev/null)"
+  create_rc=$?
+  set -e
+  if [[ "${create_rc}" -ne 0 ]]; then
+    echo "ovs-vsctl stderr: ${create_err:-"(empty)"}"
+    log_structured "ERROR" "ovs_mirror_apply_failed reason=ovs_vsctl_create_failed bridge=${bridge} mirror=${mirror_name} iface=${sensor_iface} stderr=${create_err:-empty}"
+    _mirror_refresh_and_print_diagnostics "$sensor_vm" "$bridge" "$mirror_name" 0
     return 1
   fi
+  echo "ovs-vsctl success: mirror ${mirror_name} created output-port=${sensor_iface}"
 
   # 9. Verify the live config matches our intent before claiming success.
   if ! python3 "${MIRROR_HELPER}" inspect \
       --bridge "${bridge}" \
       --mirror-name "${mirror_name}" \
-      --sensor-vm "${sensor_vm}" >/dev/null 2>&1; then
+      --sensor-vm "${sensor_vm}" \
+      --management-ip "$(_mirror_get_sensor_ip "$sensor_vm")" >/dev/null 2>&1; then
     log_structured "ERROR" "ovs_mirror_apply_failed reason=post_apply_inconsistent bridge=${bridge} mirror=${mirror_name} iface=${sensor_iface}"
-    _mirror_refresh_state "$sensor_vm" "$bridge" "$mirror_name" 0
+    _mirror_refresh_and_print_diagnostics "$sensor_vm" "$bridge" "$mirror_name" 0
     return 1
   fi
 
-  _mirror_refresh_state "$sensor_vm" "$bridge" "$mirror_name" 1
+  _mirror_refresh_and_print_diagnostics "$sensor_vm" "$bridge" "$mirror_name" 1
   log_structured "INFO" "ovs_mirror_apply_success sensor_vm=${sensor_vm} bridge=${bridge} mirror=${mirror_name} iface=${sensor_iface} idempotent=false"
   return 0
 }
@@ -398,14 +532,17 @@ verify_ovs_mirror() {
 
   log_structured "INFO" "ovs_mirror_verify_started sensor_vm=${sensor_vm} bridge=${bridge} mirror=${mirror_name}"
   _mirror_helper_available || return 1
+  echo "=== OVS mirror verify diagnostics ==="
 
   mkdir -p "$(dirname "${XDR_LAB_MIRROR_STATE_JSON}")"
   if python3 "${MIRROR_HELPER}" verify \
       --bridge "${bridge}" \
       --mirror-name "${mirror_name}" \
       --sensor-vm "${sensor_vm}" \
+      --management-ip "$(_mirror_get_sensor_ip "$sensor_vm")" \
       --state-path "${XDR_LAB_MIRROR_STATE_JSON}" >/dev/null 2>&1; then
     _invoke_state_refresh "$sensor_vm" 0
+    _mirror_print_state_diagnostics
     log_structured "INFO" "ovs_mirror_verify_success sensor_vm=${sensor_vm} bridge=${bridge} mirror=${mirror_name}"
     return 0
   fi
@@ -417,6 +554,7 @@ verify_ovs_mirror() {
   output_port_matches="$(_mirror_state_field output_port_matches_capture)"
   sensor_iface="$(_mirror_state_field sensor_interface)"
   sensor_mgmt_iface="$(_mirror_state_field sensor_mgmt_interface)"
+  _mirror_print_state_diagnostics
   log_structured "WARN" "ovs_mirror_verify_failed sensor_vm=${sensor_vm} bridge=${bridge} mirror=${mirror_name} mirror_exists=${mirror_exists} output_port_exists=${output_port_exists} output_port_matches_capture=${output_port_matches} sensor_mgmt_iface=${sensor_mgmt_iface:-unknown} sensor_capture_iface=${sensor_iface:-unknown}"
   return 1
 }
@@ -826,7 +964,7 @@ die() {
 
 _known_cli_actions=(
   download deploy start stop destroy status validate access cleanup
-  snapshot scenario runtime mirror nat vnc-proxy web-console windows-console images vm sensor
+  snapshot scenario runtime mirror nat vnc-proxy web-console windows-console images vm sensor atomic tools
 )
 
 is_known_cli_action() {
@@ -3767,6 +3905,15 @@ runtime_cli_dispatch() {
   python3 "${CALDERA_HELPER}" --xdr-root "${XDR_ROOT}" runtime "$@"
 }
 
+tool_cli_dispatch() {
+  if [[ ! -f "${TOOL_HELPER}" ]]; then
+    log_structured "ERROR" "tool_helper_missing path=${TOOL_HELPER}"
+    return 2
+  fi
+  log_structured "INFO" "tool_cli_dispatch argv=${*}"
+  python3 "${TOOL_HELPER}" --xdr-root "${XDR_ROOT}" "$@"
+}
+
 snapshot_cli_dispatch() {
   local sub="${1:-}"
   local rc=0
@@ -3893,7 +4040,7 @@ snapshot_cli_dispatch() {
 
 usage() {
   cat <<'EOF'
-Usage: xdr-lab-vm-manager.sh <download|deploy|start|stop|destroy|status|validate|access|cleanup|snapshot|scenario|runtime|mirror|nat|vnc-proxy|web-console|windows-console|images|sensor> ...
+Usage: xdr-lab-vm-manager.sh <download|deploy|start|stop|destroy|status|validate|access|cleanup|snapshot|scenario|runtime|mirror|nat|vnc-proxy|web-console|windows-console|images|sensor|atomic|tools> ...
 
 Image cache (manifest-driven, opt-in: enabled in ${XDR_LAB_IMAGES_MANIFEST} or XDR_LAB_USE_IMAGE_MANIFEST=1):
   xdr-lab-vm-manager.sh download                  # all manifest artifacts
@@ -3946,6 +4093,11 @@ Examples:
   xdr-lab-vm-manager.sh runtime inspect
   xdr-lab-vm-manager.sh runtime jsonl tail --lines 30
   xdr-lab-vm-manager.sh runtime evidence bundle --out ~/xdr-lab-evidence
+  xdr-lab-vm-manager.sh atomic install
+  xdr-lab-vm-manager.sh atomic verify
+  xdr-lab-vm-manager.sh atomic update
+  xdr-lab-vm-manager.sh tools list
+  xdr-lab-vm-manager.sh tools verify
   xdr-lab-vm-manager.sh mirror apply               # apply OVS mirror (state-aware)
   xdr-lab-vm-manager.sh mirror verify              # check mirror.json against OVS reality
   xdr-lab-vm-manager.sh mirror validate-traffic    # SSH tcpdump + host probe
@@ -4067,6 +4219,16 @@ main() {
   if [[ "$action" == "runtime" ]]; then
     log_structured "INFO" "cli action=runtime argv=${*}"
     runtime_cli_dispatch "${@:2}"
+    exit $?
+  fi
+  if [[ "$action" == "atomic" ]]; then
+    log_structured "INFO" "cli action=atomic argv=${*}"
+    tool_cli_dispatch atomic "${@:2}"
+    exit $?
+  fi
+  if [[ "$action" == "tools" ]]; then
+    log_structured "INFO" "cli action=tools argv=${*}"
+    tool_cli_dispatch tools "${@:2}"
     exit $?
   fi
   # `mirror` is the only action whose target slot is itself a subcommand

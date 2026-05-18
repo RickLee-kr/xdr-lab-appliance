@@ -100,6 +100,7 @@ test_cli_help() {
   assert_contains "help usage" "Usage:" "${out}"
   assert_contains "help strict option" "--strict" "${out}"
   assert_contains "help timeout option" "--timeout SECONDS" "${out}"
+  assert_contains "help repair option" "--repair" "${out}"
 }
 
 test_cli_json_mode() {
@@ -119,6 +120,21 @@ test_cli_json_mode() {
   assert_contains "json mode non-strict" '"mode": "non-strict"' "${out}"
   assert_contains "json host network component" '"host_network"' "${out}"
   assert_contains "json host network status" '"status": "PASS"' "${out}"
+  rm -rf "${tmp}"
+}
+
+test_repair_flag_accepted() {
+  local tmp out rc
+  tmp="$(mktemp -d)"
+  setup_appliance_stub_dir "${tmp}"
+  stub_all_validators_pass "${tmp}"
+  set +e
+  out="$(XDR_ROOT="${tmp}" XDR_LAB_BOOTSTRAP_DIR="${tmp}/bootstrap" \
+    bash "${BOOT}/validate-appliance.sh" --strict --wait --repair 2>&1)"
+  rc=$?
+  set -e
+  assert_eq "repair parser exit" "0" "${rc}"
+  assert_contains "repair mode logged" "repair=1" "${out}"
   rm -rf "${tmp}"
 }
 
@@ -161,6 +177,29 @@ EOS
   rm -rf "${tmp}"
 }
 
+test_strict_web_console_fail_warns() {
+  local tmp out rc
+  tmp="$(mktemp -d)"
+  setup_appliance_stub_dir "${tmp}"
+  stub_all_validators_pass "${tmp}"
+  cat >"${tmp}/bootstrap/validate-web-console.sh" <<'EOS'
+#!/usr/bin/env bash
+REQUIRE_ROOT=0
+exit 10
+EOS
+  chmod +x "${tmp}/bootstrap/validate-web-console.sh"
+  set +e
+  out="$(XDR_ROOT="${tmp}" XDR_LAB_BOOTSTRAP_DIR="${tmp}/bootstrap" \
+    bash "${BOOT}/validate-appliance.sh" --strict 2>&1)"
+  rc=$?
+  set -e
+  assert_eq "strict web console optional exit" "0" "${rc}"
+  assert_contains "strict web console warn status" "[WARN] web_console" "${out}"
+  assert_contains "strict web console overall warn" "RESULT: WARN" "${out}"
+  assert_contains "strict web console warning class" "FAILURE_CLASS=warning" "${out}"
+  rm -rf "${tmp}"
+}
+
 test_non_strict_optional_fail_warns() {
   local tmp out rc
   tmp="$(mktemp -d)"
@@ -180,6 +219,31 @@ EOS
   assert_eq "non-strict optional fail exit" "0" "${rc}"
   assert_contains "non-strict optional fail warn" "[WARN] libvirt" "${out}"
   assert_contains "non-strict optional fail overall warn" "RESULT: WARN" "${out}"
+  rm -rf "${tmp}"
+}
+
+test_wait_passes_to_caldera_validator() {
+  local tmp out rc args_file
+  tmp="$(mktemp -d)"
+  args_file="${tmp}/caldera.args"
+  setup_appliance_stub_dir "${tmp}"
+  stub_all_validators_pass "${tmp}"
+  cat >"${tmp}/bootstrap/validate-caldera.sh" <<EOS
+#!/usr/bin/env bash
+REQUIRE_ROOT=0
+printf '%s\n' "\$*" >"${args_file}"
+exit 0
+EOS
+  chmod +x "${tmp}/bootstrap/validate-caldera.sh"
+  set +e
+  out="$(XDR_ROOT="${tmp}" XDR_LAB_BOOTSTRAP_DIR="${tmp}/bootstrap" \
+    bash "${BOOT}/validate-appliance.sh" --wait --timeout 7 2>&1)"
+  rc=$?
+  set -e
+  assert_eq "wait mode exit" "0" "${rc}"
+  assert_contains "wait mode logged" "wait=1 timeout=7" "${out}"
+  assert_contains "caldera received wait" "--wait" "$(<"${args_file}")"
+  assert_contains "caldera received timeout" "--timeout 7" "$(<"${args_file}")"
   rm -rf "${tmp}"
 }
 
@@ -240,9 +304,12 @@ test_cli_accepts_strict
 test_cli_unknown_argument
 test_cli_help
 test_cli_json_mode
+test_repair_flag_accepted
 test_cli_json_strict_mode_field
 test_strict_optional_fail_fails
+test_strict_web_console_fail_warns
 test_non_strict_optional_fail_warns
+test_wait_passes_to_caldera_validator
 test_timeout_requires_value
 test_timeout_invalid_value
 test_timeout_zero_rejected

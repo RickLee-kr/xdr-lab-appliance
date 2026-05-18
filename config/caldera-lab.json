@@ -28,7 +28,7 @@
     "training"
   ],
   "atomic_red_team": {
-    "linux_repo_path": "/opt/atomic-red-team",
+    "linux_repo_path": "/opt/xdr-lab/runtime/tools/atomic-red-team",
     "windows_repo_path": "C:\\AtomicRedTeam\\atomic-red-team",
     "invoke_module_note": "Install-Module invoke-atomicredteam (optional; see bootstrap/)",
     "safe_defaults_readme": "XDR-LAB-ATOMIC-SAFE.md"
@@ -74,6 +74,9 @@
     "_doc": "Lab VMs that receive Sandcat bootstrap via lab scenario agent deploy (SSH Linux paths; Windows path from lab-vms.json inventory).",
     "sensor-vm": {
       "enabled": true,
+      "observer_only": true,
+      "requires_agent": false,
+      "requires_caldera_agent": false,
       "bootstrap": "linux",
       "ssh_user": "ubuntu"
     },

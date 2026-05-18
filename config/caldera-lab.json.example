@@ -110,12 +110,12 @@
   },
 
   "_help_atomic_red_team": [
-    "Atomic Red Team repo/module paths (documentation and manual runs). caldera_orchestration.py does not consume this block.",
-    "Linux: bootstrap/atomic-red-team-linux.sh → ATOMIC_RED_TEAM_PATH=/opt/atomic-red-team recommended.",
+    "Atomic Red Team repo/module paths (documentation and manual runs). Runtime-managed tools live under /opt/xdr-lab/runtime/tools.",
+    "Linux: aella_cli lab atomic install → /opt/xdr-lab/runtime/tools/atomic-red-team.",
     "Windows: bootstrap/atomic-red-team-windows.ps1 → ATOMIC_RED_TEAM_PATH and repo at the same path."
   ],
   "atomic_red_team": {
-    "linux_repo_path": "/opt/atomic-red-team",
+    "linux_repo_path": "/opt/xdr-lab/runtime/tools/atomic-red-team",
     "windows_repo_path": "C:\\AtomicRedTeam\\atomic-red-team",
     "invoke_module_note": "Install-Module invoke-atomicredteam (optional; see bootstrap scripts)",
     "safe_defaults_readme": "XDR-LAB-ATOMIC-SAFE.md (created at repo root after clone)"
@@ -202,6 +202,9 @@
   "agents": {
     "sensor-vm": {
       "enabled": true,
+      "observer_only": true,
+      "requires_agent": false,
+      "requires_caldera_agent": false,
       "bootstrap": "linux",
       "ssh_user": "ubuntu"
     },

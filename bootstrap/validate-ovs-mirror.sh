@@ -11,6 +11,7 @@
 #   20  ovs-vsctl unavailable or failed
 #   30  sensor VM not running
 #   31  sensor vnet not resolved
+#   32  sensor capture NIC has an IP address
 #   40  mirror missing
 #   41  mirror output-port mismatch
 #   42  mirror select_all not enabled
@@ -140,6 +141,8 @@ sensor_vnet_ok=0
 sensor_vnet_detail="sensor management/capture vnets not resolved on ${LAB_BRIDGE}"
 sensor_mgmt_iface=""
 sensor_capture_iface=""
+sensor_capture_no_ip_ok=0
+sensor_capture_no_ip_detail="skipped — sensor capture vnet unavailable"
 sensor_vnet_out=""
 sensor_vnet_rc=0
 if [[ "${sensor_run_ok}" -eq 1 ]]; then
@@ -148,13 +151,18 @@ if [[ "${sensor_run_ok}" -eq 1 ]]; then
   sensor_vnet_rc=$?
   set -e
   if [[ "${sensor_vnet_rc}" -eq 0 && -n "${sensor_vnet_out}" ]]; then
-    sensor_mgmt_iface="$(printf '%s\n' "${sensor_vnet_out}" | awk 'NF {print; exit}')"
-    sensor_capture_iface="$(printf '%s\n' "${sensor_vnet_out}" | awk 'NF {n++; if (n == 2) {print; exit}}')"
+    role_vnet_out="$(rv_sensor_role_vnets_on_bridge "${SENSOR_VM}" "${LAB_BRIDGE}" 2>&1)" || role_vnet_out=""
+    sensor_mgmt_iface="$(printf '%s\n' "${role_vnet_out}" | awk 'NF {print; exit}')"
+    sensor_capture_iface="$(printf '%s\n' "${role_vnet_out}" | awk 'NF {n++; if (n == 2) {print; exit}}')"
     if [[ -n "${sensor_capture_iface}" ]]; then
       sensor_vnet_ok=1
       sensor_vnet_detail="sensor_mgmt_interface=${sensor_mgmt_iface} sensor_capture_interface=${sensor_capture_iface} on ${LAB_BRIDGE}"
+      if [[ -n "${sensor_mgmt_iface}" && "${sensor_mgmt_iface}" == "${sensor_capture_iface}" ]]; then
+        sensor_vnet_ok=0
+        sensor_vnet_detail="management and capture interfaces must be distinct; management NIC MUST NOT be mirror output"
+      fi
     else
-      sensor_vnet_detail="dedicated capture interface missing; single-NIC mirror reuse is unsupported"
+      sensor_vnet_detail="${role_vnet_out:-dedicated capture interface missing; single-NIC mirror reuse is unsupported}"
     fi
   elif rv_text_is_virsh_permission_denied "${sensor_vnet_out}" \
       || rv_text_is_ovs_permission_denied "${sensor_vnet_out}"; then
@@ -180,8 +188,37 @@ else
   record_skip sensor_vnet "${sensor_vnet_detail}"
 fi
 
+rv_probe_begin sensor_capture_no_ip
+if [[ "${sensor_vnet_ok}" -eq 1 ]]; then
+  domifaddr_out=""
+  domifaddr_rc=0
+  set +e
+  domifaddr_out="$(rv_virsh_system domifaddr "${SENSOR_VM}" 2>&1)"
+  domifaddr_rc=$?
+  set -e
+  if [[ "${domifaddr_rc}" -eq 0 ]] && grep -qE "^[[:space:]]*${sensor_capture_iface}[[:space:]]" <<<"${domifaddr_out}"; then
+    sensor_capture_no_ip_detail="capture interface ${sensor_capture_iface} has an IP address; capture NIC must stay IP-less"
+  elif [[ "${domifaddr_rc}" -ne 0 ]] && rv_text_is_virsh_permission_denied "${domifaddr_out}"; then
+    sensor_capture_no_ip_detail="requires root privileges (virsh domifaddr)"
+    record_skip sensor_capture_no_ip "${sensor_capture_no_ip_detail}"
+    sensor_capture_no_ip_ok=-1
+  else
+    sensor_capture_no_ip_ok=1
+    sensor_capture_no_ip_detail="capture interface ${sensor_capture_iface} has no IP address"
+  fi
+  if [[ "${sensor_capture_no_ip_ok}" -ne -1 ]]; then
+    rv_probe_end sensor_capture_no_ip "${sensor_capture_no_ip_ok}"
+    record sensor_capture_no_ip "${sensor_capture_no_ip_ok}" "${sensor_capture_no_ip_detail}" 32
+  else
+    rv_probe_end sensor_capture_no_ip 0
+  fi
+else
+  rv_probe_end sensor_capture_no_ip 0
+  record_skip sensor_capture_no_ip "${sensor_capture_no_ip_detail}"
+fi
+
 SENSOR_CHECKS_USABLE=0
-if [[ "${sensor_run_ok}" -eq 1 && "${sensor_vnet_ok}" -eq 1 ]]; then
+if [[ "${sensor_run_ok}" -eq 1 && "${sensor_vnet_ok}" -eq 1 && "${sensor_capture_no_ip_ok}" -eq 1 ]]; then
   SENSOR_CHECKS_USABLE=1
 fi
 

@@ -20,7 +20,8 @@
 │  1) CALDERA server prep (docker / external instance / bootstrap)   │
 │  2) Issue API key + configure XDR_CALDERA_API_KEY or api_key_file │
 │  3) Edit config/caldera-lab.json and scenarios/ packs              │
-│       - base_url                                                   │
+│       - base_url (appliance/orchestrator REST)                     │
+│       - agent_base_url (guest Sandcat callback URL)                │
 │       - scenarios.<name>.adversary_id  (repo packs may stay null;  │
 │         UUID fallback in config/caldera-lab.json — §4.4)           │
 │     (optional) Atomic Red Team — see bootstrap/atomic-red-team-*    │
@@ -46,7 +47,7 @@ Prerequisites per step and where to look when something fails are covered in the
 
 ## 2. CALDERA server preparation
 
-XDR Lab orchestration **does not start** the CALDERA process itself. Point `base_url` in `config/caldera-lab.json` at a CALDERA instance you already run. To run CALDERA on the appliance host, you may use the optional bootstrap script `bootstrap/caldera-server-bootstrap.sh` (Ubuntu 24.04, systemd, API key file, bind address). Typical topologies:
+XDR Lab orchestration **does not start** the CALDERA process itself. Point `base_url` in `config/caldera-lab.json` at a CALDERA instance the appliance host can reach, and point `agent_base_url` at the address guest VMs can reach for Sandcat callbacks. In the standard br0 lab topology this is usually `base_url=http://127.0.0.1:8888` and `agent_base_url=http://10.10.10.1:8888`. To run CALDERA on the appliance host, you may use the optional bootstrap script `bootstrap/caldera-server-bootstrap.sh` (Ubuntu 24.04, systemd, API key file, bind address). Typical topologies:
 
 ### 2.0 CALDERA Server Bring-Up
 
@@ -176,8 +177,8 @@ Golden Image or post-install repair should leave CALDERA in a state where **`cal
 | Script | Role |
 | --- | --- |
 | `bootstrap/ensure-caldera-runtime.sh` | Idempotent venv + `requirements.txt` repair; resolves runtime user without hard-coding appliance accounts (`XDR_LAB_CALDERA_USER` overrides when set). |
-| `bootstrap/repair-caldera-service.sh` | Writes `/etc/systemd/system/caldera.service` with `After=xdr-lab-host-network.service`, valid `User`/`Group`, and `ExecStart` pointing at `.venv/bin/python3`. Pass `--start` to start after repair. |
-| `bootstrap/validate-caldera.sh` | Read-only ordered checks (unit → user → ExecStart → `server.py` → active → port → HTTP). |
+| `bootstrap/repair-caldera-service.sh` | Reconciles `/etc/systemd/system/caldera.service` with `After=xdr-lab-host-network.service`, valid `User`/`Group`, and `ExecStart` pointing at `.venv/bin/python3`. Pass `--start` to start after repair; if unit/config are unchanged and CALDERA is already active, restart is skipped. |
+| `bootstrap/validate-caldera.sh` | Read-only ordered checks (unit → user → ExecStart → `server.py` → active → port → HTTP). Use `--wait` after repair/restart so first-start `--build` grace is treated as startup, not a hard failure. |
 | `bootstrap/ensure-caldera-api-key.sh` | Create/sync `/etc/xdr-lab/caldera-api-key` with `conf/default.yml` `api_key_red` (argon2). |
 | `bootstrap/validate-appliance.sh` | One command: host-network + CALDERA + libvirt (+ optional mirror validator if present). |
 | `bootstrap/deploy-caldera-runtime-fix.sh` | One-shot: install scripts under `/opt/xdr-lab/bootstrap`, run ensure + repair `--start` + validate. |
@@ -206,13 +207,23 @@ Golden Image or post-install repair should leave CALDERA in a state where **`cal
 
 `caldera_process` is **not** inferred from `pgrep`; it passes only when the service is active **and** the port is listening.
 
+When `validate-caldera.sh --wait --timeout <seconds>` is used after
+`repair-caldera-service.sh --start` or a manual restart, the validator first
+polls CALDERA through the documented startup/build grace path. During this
+window `http_code=000` and `tcp/8888 not listening` are treated as expected
+startup signals while `server.py --build` has not bound the socket yet. If the
+wait times out, the script still prints the normal ordered diagnostics and exits
+with the CALDERA-not-ready class rather than misclassifying the race as a stale
+or dead process.
+
 **Common appliance failures**
 
 | Symptom | systemd / probe signal | Fix |
 | --- | --- | --- |
 | `status=217/USER` | `ExecMainStatus=217` — `User=` account missing | `ensure-caldera-runtime.sh` + `repair-caldera-service.sh --start` |
 | `status=203/EXEC` | `ExecMainStatus=203` — `.venv/bin/python3` missing | `ensure-caldera-runtime.sh` (venv repair) then `repair-caldera-service.sh --start` |
-| Port **8888 not listening** | `caldera_port_listen` FAIL while unit auto-restarts | Fix venv/deps; `journalctl -u caldera.service`; first start may take minutes (`--build`) |
+| Port **8888 not listening** immediately after repair/restart | `caldera_port_listen` would fail while `server.py --build` is still before bind | Run `validate-caldera.sh --wait --timeout 300`; first start may take minutes (`--build`) |
+| Port **8888 not listening** after wait timeout | `caldera_port_listen` FAIL while unit auto-restarts or never binds | Fix venv/deps; `journalctl -u caldera.service` |
 | HTTP probe failed | TCP up but `/api/agents` unreachable | Check `conf/default.yml` `host`/`port`, firewall, API process logs |
 
 Deploy on a live appliance:
@@ -246,7 +257,7 @@ Then open the UI at `http://<host>:<port>/` and confirm red-operator login.
 | systemd **start** loops or immediate crash | Missing venv deps, corrupt clone, port in use | `journalctl -u caldera.service -e`; verify `pip install -r requirements.txt`; `ss -lntp \| grep 8888`. |
 | UI never loads / build hangs | Node/npm missing, low RAM, first `--build` | Ensure `nodejs`+`npm` installed; allow several minutes; watch foreground logs. |
 | **`plugins` errors on boot** | Submodule not checked out | `git submodule update --init --recursive`. |
-| **Agents cannot callback** | `app.contact.http` / bind address only listens on `127.0.0.1` | Bind to an address victims route to, or place a reverse proxy; align `base_url` in `caldera-lab.json`. |
+| **Agents cannot callback** | Bootstrap uses `127.0.0.1`, or CALDERA only listens on loopback from guest perspective | Bind to an address victims route to, or place a reverse proxy; align `agent_base_url` in `caldera-lab.json` with the guest-reachable URL. |
 | **401 on every REST call** | Key drift between `default.yml` and XDR Lab | Reconcile `api_key_red` and `XDR_CALDERA_API_KEY` / `api_key_file`. |
 
 #### Troubleshooting checklist (server bring-up)
@@ -262,14 +273,14 @@ Then open the UI at `http://<host>:<port>/` and confirm red-operator login.
 
 ### 2.1 Recommended topologies
 
-- **(A) Docker Compose on the appliance host** — simplest because `caldera_orchestration.py` uses HTTP only. Expose `127.0.0.1:8888` and set `base_url` to `http://127.0.0.1:8888`.
+- **(A) Docker Compose on the appliance host** — simplest because `caldera_orchestration.py` uses HTTP only. Expose the service to the host and lab bridge, set `base_url` to `http://127.0.0.1:8888`, and set `agent_base_url` to the guest-reachable bridge address such as `http://10.10.10.1:8888`.
 - **(B) Dedicated VM inside the lab (`test-vm1`, etc.)** — run the CALDERA container on a VM in lab subnet `10.10.10.0/24`. Set `base_url` like `http://10.10.10.40:8888`. Agents reach CALDERA directly without external NAT.
 - **(C) External instance** — any host reachable from the lab subnet. You manage firewall and routing.
 
 > Every topology must satisfy:
 >
 > 1. From the appliance host, `curl <base_url>/api/agents` returns **some** HTTP response (even auth failure).
-> 2. From lab VMs (`windows-victim`, `linux-server`), CALDERA is reachable over HTTP/HTTPS (Sandcat callbacks).
+> 2. From lab VMs (`windows-victim`, `victim-linux`, `sensor-vm`), `agent_base_url` is reachable over HTTP/HTTPS for Sandcat callbacks.
 
 ### 2.2 Quick docker compose example (reference only, unofficial)
 
@@ -555,6 +566,8 @@ If `scenario list` shows an empty `adversary_id` for your scenario, non-dry `sce
 **API example (list adversaries):**
 
 ```bash
+aella_cli lab caldera adversaries list
+
 BASE="$(jq -r .base_url config/caldera-lab.json)"
 curl -s -X POST -H "KEY: $XDR_CALDERA_API_KEY" -H "Content-Type: application/json" \
   -d '{"index":"adversaries"}' "${BASE}/api/rest" | jq '.[] | {adversary_id, name}'
@@ -767,7 +780,7 @@ Other pack validate messages follow report `code` / `message`. Typical fixes: `t
 
 ## 5. Agent (Sandcat) deployment flow
 
-`caldera_orchestration.py` does not ship Sandcat binaries. `agent deploy` **generates bootstrap scripts** reflecting `caldera-lab.json::base_url`, SSHs from the appliance into Linux-class VMs, and runs the script **remotely on stdin** (constitution P-9 — no apt install side effects on our side). Windows may auto-run via SSH or require manual PowerShell depending on path.
+`caldera_orchestration.py` does not ship Sandcat binaries. `agent deploy` **generates bootstrap scripts** reflecting `caldera-lab.json::agent_base_url`, SSHs from the appliance into Linux-class VMs, and runs the script **remotely on stdin** (constitution P-9 — no apt install side effects on our side). Windows may auto-run via SSH or require manual PowerShell depending on path. Do not set `agent_base_url` to `127.0.0.1` unless CALDERA is running inside the guest itself.
 
 Target VMs come from `config/caldera-lab.json::agents` (`enabled`, `bootstrap`: `linux` | `windows`, `ssh_user`, etc.). See `config/caldera-lab.json.example` `_help_agents`.
 
@@ -779,7 +792,8 @@ Before deployment the tooling verifies or reflects:
 | --- | --- |
 | Target VMs **running** (libvirt) | `aella_cli lab start <vm>` etc. |
 | **Reverse NAT** (`runtime/state/nat.json`) | On host: `aella_cli lab nat verify` (or `nat status`) for Golden Image DNAT contract vs iptables |
-| CALDERA `base_url` + **API key** | §2·§3, confirm reachability with `scenario list` |
+| CALDERA `base_url` + **API key** | §2·§3, confirm appliance reachability with `scenario list` |
+| CALDERA `agent_base_url` | Guest-reachable Sandcat callback URL, typically `http://10.10.10.1:8888` on the standard lab bridge |
 | **SSH / WinRM / RDP** reachability | Linux via SSH batch probes; Windows uses inventory such as `external_nat_port_mapping` in `config/lab-vms.json` for SSH / WinRM HTTPS / RDP TCP (ports exactly as defined in Golden Image / `lab-vms.json`; do not invent new contracts here) |
 
 ### 5.1b `scenario bootstrap validate` (CALDERA + Atomic preflight)
@@ -855,7 +869,7 @@ Even in dry-run, CALDERA unreachable, NAT warnings, stopped VMs appear on stderr
 1. From the appliance (host), SSH attempts target VMs per `lab-vms.json`/libvirt (`ssh_batch_cmd`, stdin delivery of `bootstrap-linux.sh`).
 2. On success the guest runs the Sandcat one-liner (`curl` + `python3`/`sh`) and agents register with CALDERA **asynchronously**.
 
-`bootstrap-linux.sh` is always refreshed under `${XDR_ROOT}/runtime/caldera-agent/`. Re-run deploy after changing `base_url`.
+`bootstrap-linux.sh` is always refreshed under `${XDR_ROOT}/runtime/caldera-agent/`. Re-run deploy after changing `agent_base_url`.
 
 ### 5.4 Windows VM (`bootstrap: windows`)
 
@@ -906,6 +920,7 @@ If nothing matches:
 | SSH unreachable (Linux or Windows SSH path) | Keys, `linux-server-authorized_keys`, guest ssh, firewall, NAT mapping |
 | CALDERA API key missing | §3 — `XDR_CALDERA_API_KEY` or `api_key_file` |
 | CALDERA server unreachable | `base_url`, service up, TLS/firewall, routing from appliance |
+| Agent bootstrap downloads from localhost | `agent_base_url` is missing or loopback; set it to the guest-reachable bridge URL such as `http://10.10.10.1:8888` |
 | WinRM/RDP only (Windows) | Manual `runtime/caldera-agent/bootstrap-windows.ps1` (§5.4) |
 | Agent not seen (`status` disconnected) | Re-deploy, wait, tune `host_substrings`, check CALDERA UI Agents |
 

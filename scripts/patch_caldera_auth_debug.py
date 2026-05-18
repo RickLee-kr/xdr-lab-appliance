@@ -260,12 +260,17 @@ def main() -> int:
         print(f"error: CALDERA not found at {home}", file=sys.stderr)
         return 2
 
+    changed = 0
     dest_debug = home / "app" / "utility" / "xdr_auth_debug.py"
     src_debug = args.patch_dir / "xdr_auth_debug.py"
-    shutil.copy2(src_debug, dest_debug)
-    print(f"installed {dest_debug}")
+    src_bytes = src_debug.read_bytes()
+    if not dest_debug.is_file() or dest_debug.read_bytes() != src_bytes:
+        shutil.copy2(src_debug, dest_debug)
+        changed += 1
+        print(f"installed {dest_debug}")
+    else:
+        print(f"already installed {dest_debug}")
 
-    changed = 0
     if args.upgrade:
         for rel, reps in UPGRADE_PATCHES.items():
             target = home / rel

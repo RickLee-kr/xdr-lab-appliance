@@ -20,7 +20,7 @@ assert_eq() {
 
 assert_contains() {
   local label="$1" needle="$2" haystack="$3"
-  if grep -Fq "${needle}" <<<"${haystack}"; then
+  if grep -Fq -- "${needle}" <<<"${haystack}"; then
     echo "PASS ${label}"
     PASS=$((PASS + 1))
   else
@@ -31,7 +31,7 @@ assert_contains() {
 
 assert_not_contains() {
   local label="$1" needle="$2" haystack="$3"
-  if grep -Fq "${needle}" <<<"${haystack}"; then
+  if grep -Fq -- "${needle}" <<<"${haystack}"; then
     echo "FAIL ${label} unexpected '${needle}' in output" >&2
     FAIL=$((FAIL + 1))
   else
@@ -147,6 +147,48 @@ test_validate_no_false_process_pass() {
   rm -rf "${tmp}"
 }
 
+test_validate_caldera_wait_cli() {
+  local out rc
+  set +e
+  out="$(bash "${BOOT}/validate-caldera.sh" --help 2>&1)"
+  rc=$?
+  set -e
+  assert_eq "validate-caldera help exit" "0" "${rc}"
+  assert_contains "validate-caldera help wait option" "--wait" "${out}"
+  assert_contains "validate-caldera help timeout option" "--timeout SECONDS" "${out}"
+
+  set +e
+  out="$(bash "${BOOT}/validate-caldera.sh" --timeout 0 2>&1)"
+  rc=$?
+  set -e
+  assert_eq "validate-caldera invalid timeout exit" "2" "${rc}"
+  assert_contains "validate-caldera invalid timeout message" "invalid --timeout value: 0" "${out}"
+}
+
+test_wait_retries_during_restart_grace() {
+  local out rc
+  set +e
+  out="$(XDR_LAB_CALDERA_READY_POLL_SECS=1 XDR_LAB_CALDERA_READY_PROGRESS_SECS=1 \
+    bash -c '
+      . "$1"
+      rv_caldera_port() { echo 8888; }
+      rv_caldera_base_url() { echo "http://127.0.0.1:8888"; }
+      rv_caldera_classify_startup_state() { echo FAILED; }
+      rv_caldera_stale_grace_active() { return 0; }
+      rv_caldera_port_listening() { return 1; }
+      rv_caldera_http_probe_code() { echo 000; }
+      rv_caldera_login_http_code() { echo 000; }
+      rv_caldera_http_ready() { return 1; }
+      rv_caldera_wait_ready 2
+    ' _ "${BOOT}/_runtime-validation-lib.sh" 2>&1)"
+  rc=$?
+  set -e
+  assert_eq "wait grace timeout exit" "1" "${rc}"
+  assert_contains "wait grace retries" "waiting_for_bind elapsed=" "${out}"
+  assert_contains "wait grace timeout" "FAILED timeout after 2s" "${out}"
+  assert_not_contains "wait grace no immediate unhealthy" "caldera.service unhealthy" "${out}"
+}
+
 test_ensure_creates_venv() {
   local tmp
   tmp="$(mktemp -d)"
@@ -187,6 +229,23 @@ test_repair_no_hardcoded_aella() {
   fi
 }
 
+test_repair_idempotent_restart_guard() {
+  local body
+  body="$(<"${BOOT}/repair-caldera-service.sh")"
+  assert_contains "repair skips restart when unchanged" "restart skipped (runtime unchanged)" "${body}"
+  assert_contains "repair suppresses restart for active unchanged runtime" 'if [[ "${RUNTIME_CHANGED}" -eq 0 && "${service_active}" -eq 1 ]]; then' "${body}"
+  assert_contains "repair logs restart decision inputs" 'restart decision runtime_changed=${RUNTIME_CHANGED} changed=${CHANGED} service_active=${service_active}' "${body}"
+  assert_contains "repair tracks changed state" 'changed=${CHANGED}' "${body}"
+  assert_contains "repair detects auth patch changes" "files_changed=[1-9][0-9]*" "${body}"
+}
+
+test_installer_preserves_existing_caldera_unit() {
+  local installer="${ROOT}/installer/cli-installer.sh" body
+  body="$(<"${installer}")"
+  assert_contains "installer preserves existing caldera unit" "Existing caldera.service preserved" "${body}"
+  assert_contains "installer only writes missing caldera unit" "if [[ ! -f /etc/systemd/system/caldera.service ]]" "${body}"
+}
+
 test_validate_appliance_aggregation() {
   local tmp
   tmp="$(mktemp -d)"
@@ -217,8 +276,12 @@ echo "=== test_caldera_runtime ==="
 test_validate_missing_user_217
 test_validate_missing_venv_203
 test_validate_no_false_process_pass
+test_validate_caldera_wait_cli
+test_wait_retries_during_restart_grace
 test_ensure_creates_venv
 test_repair_no_hardcoded_aella
+test_repair_idempotent_restart_guard
+test_installer_preserves_existing_caldera_unit
 test_validate_appliance_aggregation
 
 echo "---"

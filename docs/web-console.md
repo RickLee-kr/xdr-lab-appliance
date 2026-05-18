@@ -103,7 +103,7 @@ Web console is **not** part of the iptables Reverse-NAT contract checked by
 | --- | --- |
 | Per-VM wiring | `aella_cli lab web-console verify <vm>` |
 | Aggregate (optional) | `${XDR_ROOT}/bootstrap/validate-web-console.sh` |
-| Appliance bundle | `${XDR_ROOT}/bootstrap/validate-appliance.sh --strict` (fails if web console down) |
+| Appliance bundle | `${XDR_ROOT}/bootstrap/validate-appliance.sh --strict` (reports web console as WARN if down; it does not gate core lab readiness) |
 
 `nat verify` (full, without `--iptables-only`) may still record web-console listener
 state in `nat.json` for observability; treat it as **optional management**, not

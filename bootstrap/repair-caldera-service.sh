@@ -20,6 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DRY_RUN=0
 DO_START=0
+CHANGED=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
@@ -47,6 +48,13 @@ if [[ -n "${XDR_ROOT:-}" ]]; then
 fi
 
 RUNTIME_USER=""
+RUNTIME_CHANGED=0
+if [[ "${XDR_LAB_CALDERA_RUNTIME_CHANGED:-0}" == "1" ]]; then
+  RUNTIME_CHANGED=1
+  CHANGED=1
+  rv_log INFO "CALDERA runtime dependencies changed — restart required"
+fi
+
 rv_step_begin "resolve runtime user"
 if ! RUNTIME_USER="$(rv_resolve_caldera_runtime_user)"; then
   rv_step_end "resolve runtime user" 2
@@ -111,7 +119,7 @@ fi
 
 rv_step_begin "patch caldera listen config"
 if [[ -f "${CALDERA_MAIN_CONFIG}" ]]; then
-  "${VENV_PY}" - "${CALDERA_MAIN_CONFIG}" "${CALDERA_BIND_HOST}" "${CALDERA_LISTEN_PORT}" "${CALDERA_AGENT_BASE_URL}" <<'PY'
+  config_patch_status="$("${VENV_PY}" - "${CALDERA_MAIN_CONFIG}" "${CALDERA_BIND_HOST}" "${CALDERA_LISTEN_PORT}" "${CALDERA_AGENT_BASE_URL}" <<'PY'
 from pathlib import Path
 import sys
 
@@ -143,8 +151,21 @@ for key, value in (
 ):
     if not seen[key]:
         out.append(f"{key}: {value}")
-path.write_text("\n".join(out) + "\n", encoding="utf-8")
+new_text = "\n".join(out) + "\n"
+old_text = path.read_text(encoding="utf-8")
+if new_text != old_text:
+    path.write_text(new_text, encoding="utf-8")
+    print("changed")
+else:
+    print("unchanged")
 PY
+)"
+  if [[ "${config_patch_status}" == "changed" ]]; then
+    CHANGED=1
+    rv_log INFO "patched ${CALDERA_MAIN_CONFIG} bind_host=${CALDERA_BIND_HOST} listen_port=${CALDERA_LISTEN_PORT} agent_base_url=${CALDERA_AGENT_BASE_URL}"
+  else
+    rv_log INFO "${CALDERA_MAIN_CONFIG} already matches requested CALDERA listen config"
+  fi
   chown "${RUNTIME_USER}:${RUNTIME_USER}" "${CALDERA_MAIN_CONFIG}" || true
   rv_step_end "patch caldera listen config" 0
 else
@@ -155,16 +176,26 @@ fi
 rv_step_begin "write systemd unit"
 install -m 0644 /dev/null "${UNIT_PATH}.tmp"
 printf '%s\n' "${UNIT_BODY}" >"${UNIT_PATH}.tmp"
-mv "${UNIT_PATH}.tmp" "${UNIT_PATH}"
+if [[ -f "${UNIT_PATH}" ]] && cmp -s "${UNIT_PATH}.tmp" "${UNIT_PATH}"; then
+  rm -f "${UNIT_PATH}.tmp"
+  rv_log INFO "${UNIT_PATH} already matches desired unit"
+else
+  mv "${UNIT_PATH}.tmp" "${UNIT_PATH}"
+  CHANGED=1
+fi
 rv_step_end "write systemd unit" 0
 
-rv_step_begin "systemctl daemon-reload"
-if ! rv_run_with_timeout "${XDR_LAB_SYSTEMCTL_TIMEOUT_SECS}" \
-    "systemctl daemon-reload" systemctl daemon-reload; then
-  rv_step_end "systemctl daemon-reload" 6
-  exit 6
+if [[ "${CHANGED}" -eq 1 ]]; then
+  rv_step_begin "systemctl daemon-reload"
+  if ! rv_run_with_timeout "${XDR_LAB_SYSTEMCTL_TIMEOUT_SECS}" \
+      "systemctl daemon-reload" systemctl daemon-reload; then
+    rv_step_end "systemctl daemon-reload" 6
+    exit 6
+  fi
+  rv_step_end "systemctl daemon-reload" 0
+else
+  rv_log INFO "systemctl daemon-reload skipped (unit/config unchanged)"
 fi
-rv_step_end "systemctl daemon-reload" 0
 
 rv_step_begin "systemctl enable caldera.service"
 if ! rv_run_with_timeout "${XDR_LAB_SYSTEMCTL_TIMEOUT_SECS}" \
@@ -175,24 +206,43 @@ fi
 rv_step_end "systemctl enable caldera.service" 0
 
 if [[ "${DO_START}" -eq 1 ]]; then
-  rv_step_begin "kill stale CALDERA processes"
-  rv_caldera_kill_stale_servers || true
-  rv_step_end "kill stale CALDERA processes" 0
-  rv_step_begin "patch CALDERA auth debug hooks"
-  PATCH_PY="${SCRIPT_DIR}/../scripts/patch_caldera_auth_debug.py"
-  if [[ -f "${PATCH_PY}" ]]; then
-    "${VENV_PY}" "${PATCH_PY}" --caldera-home "${CALDERA_HOME}" || rv_log WARN "patch_caldera_auth_debug failed (non-fatal)"
+  service_active=0
+  if rv_systemd_unit_active caldera.service; then
+    service_active=1
   fi
-  rv_step_end "patch CALDERA auth debug hooks" 0
-  rv_step_begin "restart caldera.service"
-  systemctl reset-failed caldera.service 2>/dev/null || true
-  if ! rv_caldera_restart_service "repair-caldera-service --start"; then
-    rv_log WARN "caldera restart helper returned non-zero — service may still be starting (TimeoutStartSec=900)"
+  rv_log INFO "restart decision runtime_changed=${RUNTIME_CHANGED} changed=${CHANGED} service_active=${service_active}"
+  if [[ "${RUNTIME_CHANGED}" -eq 0 && "${service_active}" -eq 1 ]]; then
+    rv_log INFO "restart skipped (runtime unchanged)"
+    rv_caldera_assert_listener_is_systemd || true
+  else
+    rv_step_begin "kill stale CALDERA processes"
+    rv_caldera_kill_stale_servers || true
+    rv_step_end "kill stale CALDERA processes" 0
+    rv_step_begin "patch CALDERA auth debug hooks"
+    PATCH_PY="${SCRIPT_DIR}/../scripts/patch_caldera_auth_debug.py"
+    if [[ -f "${PATCH_PY}" ]]; then
+      patch_out="$("${VENV_PY}" "${PATCH_PY}" --caldera-home "${CALDERA_HOME}" 2>&1)" \
+        || rv_log WARN "patch_caldera_auth_debug failed (non-fatal): ${patch_out}"
+      if grep -Eq 'files_changed=[1-9][0-9]*' <<<"${patch_out:-}"; then
+        CHANGED=1
+        rv_log INFO "CALDERA auth/runtime patch changed — restart required"
+      elif [[ -n "${patch_out:-}" ]]; then
+        while IFS= read -r line; do
+          [[ -n "${line}" ]] && rv_log INFO "patch_caldera_auth_debug: ${line}"
+        done <<<"${patch_out}"
+      fi
+    fi
+    rv_step_end "patch CALDERA auth debug hooks" 0
+    rv_step_begin "restart caldera.service"
+    systemctl reset-failed caldera.service 2>/dev/null || true
+    if ! rv_caldera_restart_service "repair-caldera-service --start"; then
+      rv_log WARN "caldera restart helper returned non-zero — service may still be starting (TimeoutStartSec=900)"
+    fi
+    rv_caldera_assert_listener_is_systemd || true
+    rv_step_end "restart caldera.service" 0
   fi
-  rv_caldera_assert_listener_is_systemd || true
   rv_caldera_log_runtime_auth_diag || true
-  rv_step_end "restart caldera.service" 0
 fi
 
-rv_log INFO "repair-caldera-service finished user=${RUNTIME_USER} start=${DO_START}"
+rv_log INFO "repair-caldera-service finished user=${RUNTIME_USER} start=${DO_START} changed=${CHANGED} runtime_changed=${RUNTIME_CHANGED}"
 exit 0

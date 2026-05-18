@@ -9,6 +9,7 @@
 #   --json
 #   --wait
 #   --timeout SECONDS
+#   --repair
 #   --help
 #
 # Exit codes:
@@ -25,6 +26,7 @@ _BOOTSTRAP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JSON_MODE=0
 STRICT_MODE=0
 WAIT_MODE=0
+REPAIR_MODE=0
 COMPONENT_TIMEOUT_SECS=120
 
 print_usage() {
@@ -37,6 +39,7 @@ Options:
   --json
   --wait
   --timeout SECONDS
+  --repair
   --help
 EOF
 }
@@ -46,6 +49,7 @@ while [[ $# -gt 0 ]]; do
     --json) JSON_MODE=1 ;;
     --strict) STRICT_MODE=1 ;;
     --wait) WAIT_MODE=1 ;;
+    --repair) REPAIR_MODE=1 ;;
     --timeout)
       shift
       if [[ $# -eq 0 ]]; then
@@ -97,6 +101,7 @@ component_status_by_id() {
 
 classify_component() {
   local idx="$1"
+  local id="${COMPONENTS[$idx]}"
   local rc="${COMPONENT_RCS[$idx]}"
   local required="${COMPONENT_REQUIRED[$idx]}"
   local status reason
@@ -117,6 +122,13 @@ classify_component() {
   elif [[ "${rc}" -eq 0 ]]; then
     status="PASS"
     reason=""
+  elif [[ "${id}" == "web_console" ]]; then
+    status="WARN"
+    if [[ "${STRICT_MODE}" -eq 1 ]]; then
+      reason="optional management validator failed (strict mode does not gate core readiness)"
+    else
+      reason="optional management validator failed"
+    fi
   elif [[ "${required}" == "0" ]]; then
     if [[ "${STRICT_MODE}" -eq 1 ]]; then
       status="FAIL"
@@ -169,12 +181,17 @@ compute_overall() {
 }
 
 failure_class() {
-  local i status id rc first=""
+  local i status id rc required first="" first_optional=""
   for i in "${!COMPONENTS[@]}"; do
     status="${COMPONENT_STATUS[$i]}"
     [[ "${status}" == "FAIL" ]] || continue
     id="${COMPONENTS[$i]}"
     rc="${COMPONENT_RCS[$i]}"
+    required="${COMPONENT_REQUIRED[$i]}"
+    if [[ "${required}" != "1" ]]; then
+      [[ -z "${first_optional}" ]] && first_optional="${id}"
+      continue
+    fi
     case "${id}:${rc}" in
       host_network:${RV_EXIT_PRIVILEGE_SKIP}|libvirt:${RV_EXIT_PRIVILEGE_SKIP}|ovs_mirror:${RV_EXIT_PRIVILEGE_SKIP})
         echo "${id}_privilege"
@@ -182,6 +199,7 @@ failure_class() {
         ;;
       caldera:35) echo "caldera_api_not_authenticated"; return 0 ;;
       caldera:30|caldera:40) echo "caldera_unreachable"; return 0 ;;
+      caldera:${RV_EXIT_CALDERA_NOT_READY}) echo "caldera_starting"; return 0 ;;
       caldera:5|caldera:6|caldera:7|caldera:8|caldera:10|caldera:15|caldera:20)
         echo "caldera_runtime"
         return 0
@@ -196,6 +214,8 @@ failure_class() {
   done
   if [[ -n "${first}" ]]; then
     echo "${first}"
+  elif [[ -n "${first_optional}" ]]; then
+    echo "optional_${first_optional}"
   elif [[ "${OVERALL_RESULT}" == "WARN" ]]; then
     echo "warning"
   else
@@ -228,26 +248,9 @@ readiness_label() {
   esac
 }
 
-wait_for_caldera_if_requested() {
-  local line wait_rc=0
-  if [[ "${WAIT_MODE}" -eq 0 ]]; then
-    return 0
-  fi
-  rv_log INFO "caldera wait enabled timeout=${COMPONENT_TIMEOUT_SECS}s"
-  set +e
-  while IFS= read -r line; do
-    [[ -n "${line}" ]] && rv_log INFO "caldera wait: ${line}"
-  done < <(rv_caldera_wait_ready "${COMPONENT_TIMEOUT_SECS}")
-  wait_rc=$?
-  set -e
-  if [[ "${wait_rc}" -ne 0 ]]; then
-    rv_log WARN "caldera wait finished without HTTP READY (rc=${wait_rc})"
-  fi
-  return 0
-}
-
 run_component() {
-  local id="$1" script="$2" required="$3" rc=0 path idx
+  local id="$1" script="$2" required="$3" rc=0 path idx run_timeout
+  shift 3
   if ! path="$(rv_script_path "${script}")"; then
     COMPONENTS+=("${id}")
     COMPONENT_REQUIRED+=("${required}")
@@ -267,12 +270,16 @@ run_component() {
     return 0
   fi
   rv_probe_begin "${id}"
+  run_timeout="${COMPONENT_TIMEOUT_SECS}"
+  if [[ "${id}" == "caldera" && "${WAIT_MODE}" -eq 1 ]]; then
+    run_timeout=$((COMPONENT_TIMEOUT_SECS + 60))
+  fi
   set +e
-  rv_run_with_timeout "${COMPONENT_TIMEOUT_SECS}" "${id}" bash -c '
+  rv_run_with_timeout "${run_timeout}" "${id}" bash -c '
     # shellcheck source=_runtime-validation-lib.sh
     . "'"${_BOOTSTRAP_DIR}"'/_runtime-validation-lib.sh"
-    rv_exec_validator "$1"
-  ' _ "${path}"
+    rv_exec_validator "$@"
+  ' _ "${path}" "$@"
   rc=$?
   set -e
   if [[ "${rc}" -eq 124 ]]; then
@@ -288,14 +295,68 @@ run_component() {
   classify_component "${idx}"
 }
 
-rv_log INFO "validate-appliance start mode=$(mode_label) wait=${WAIT_MODE} timeout=${COMPONENT_TIMEOUT_SECS}"
+rerun_component_in_place() {
+  local idx="$1" id="$2" script="$3" required="$4" rc=0 path run_timeout
+  shift 4
+  if ! path="$(rv_script_path "${script}")"; then
+    return 1
+  fi
+  rv_probe_begin "${id}"
+  run_timeout="${COMPONENT_TIMEOUT_SECS}"
+  set +e
+  rv_run_with_timeout "${run_timeout}" "${id}" bash -c '
+    # shellcheck source=_runtime-validation-lib.sh
+    . "'"${_BOOTSTRAP_DIR}"'/_runtime-validation-lib.sh"
+    rv_exec_validator "$@"
+  ' _ "${path}" "$@"
+  rc=$?
+  set -e
+  rv_probe_end "${id}" "$([[ "${rc}" -eq 0 ]] && echo 1 || echo 0)"
+  COMPONENTS[$idx]="${id}"
+  COMPONENT_RCS[$idx]="${rc}"
+  COMPONENT_REQUIRED[$idx]="${required}"
+  COMPONENT_STATUS[$idx]=""
+  COMPONENT_REASON[$idx]=""
+  classify_component "${idx}"
+}
+
+run_ovs_mirror_component() {
+  local idx repair_script repair_rc
+  run_component ovs_mirror validate-ovs-mirror.sh 0
+  idx=$((${#COMPONENTS[@]} - 1))
+  if [[ "${REPAIR_MODE}" -ne 1 || "${COMPONENT_RCS[$idx]}" -eq 0 || "${COMPONENT_RCS[$idx]}" -eq "${RV_EXIT_PRIVILEGE_SKIP}" ]]; then
+    return 0
+  fi
+  if ! repair_script="$(rv_script_path ensure-ovs-mirror.sh)"; then
+    rv_log WARN "OVS mirror repair requested but ensure-ovs-mirror.sh is missing"
+    COMPONENT_REASON[$idx]="${COMPONENT_REASON[$idx]} repair unavailable: ensure-ovs-mirror.sh missing"
+    return 0
+  fi
+  rv_log WARN "OVS mirror inconsistent; repair requested, applying mirror before re-validation"
+  set +e
+  rv_run_with_timeout "${COMPONENT_TIMEOUT_SECS}" "ovs_mirror_repair" "${repair_script}"
+  repair_rc=$?
+  set -e
+  if [[ "${repair_rc}" -ne 0 ]]; then
+    rv_log ERROR "OVS mirror repair failed rc=${repair_rc}; keeping original validation result"
+    COMPONENT_REASON[$idx]="${COMPONENT_REASON[$idx]} repair failed rc=${repair_rc}"
+    return 0
+  fi
+  rv_log INFO "OVS mirror repair completed; re-running mirror validation"
+  rerun_component_in_place "${idx}" ovs_mirror validate-ovs-mirror.sh 0
+}
+
+rv_log INFO "validate-appliance start mode=$(mode_label) wait=${WAIT_MODE} timeout=${COMPONENT_TIMEOUT_SECS} repair=${REPAIR_MODE}"
 
 run_component host_network validate-host-network.sh 1
-wait_for_caldera_if_requested
-run_component caldera validate-caldera.sh 1
+if [[ "${WAIT_MODE}" -eq 1 ]]; then
+  run_component caldera validate-caldera.sh 1 --wait --timeout "${COMPONENT_TIMEOUT_SECS}"
+else
+  run_component caldera validate-caldera.sh 1
+fi
 run_component libvirt validate-libvirt.sh 0
 run_component sensor_identity validate-sensor-identity.sh 0
-run_component ovs_mirror validate-ovs-mirror.sh 0
+run_ovs_mirror_component
 run_component web_console validate-web-console.sh 0
 
 compute_overall
@@ -305,8 +366,7 @@ INFRASTRUCTURE_READY="false"
 if [[ "$(component_status_by_id host_network)" == "PASS" \
     && "$(component_status_by_id caldera)" == "PASS" \
     && "$(component_status_by_id libvirt)" == "PASS" \
-    && "$(component_status_by_id ovs_mirror)" == "PASS" \
-    && "$(component_status_by_id web_console)" == "PASS" ]]; then
+    && "$(component_status_by_id ovs_mirror)" == "PASS" ]]; then
   INFRASTRUCTURE_READY="true"
 fi
 if [[ "${INFRASTRUCTURE_READY}" == "true" \

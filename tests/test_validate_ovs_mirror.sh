@@ -80,6 +80,14 @@ EOF
       fi
       exit 0
       ;;
+    domifaddr)
+      cat <<EOF
+ Name       MAC address          Protocol     Address
+-------------------------------------------------------------------------------
+ ${MOCK_SENSOR_IFACE:-vnet3}  ${MOCK_SENSOR_MAC:-52:54:00:00:00:01}    ipv4         ${MOCK_SENSOR_IP:-10.10.10.10}/24
+EOF
+      exit 0
+      ;;
     net-dumpxml)
       case "${2:-}" in
         ovs-net)

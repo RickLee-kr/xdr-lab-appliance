@@ -2,7 +2,7 @@
   "scenario_id": "recon",
   "display_name": "Reconnaissance",
   "description": "Host and network discovery (ping, nslookup, curl, scan-like activity) to validate NDR, firewall, DNS, and ICMP telemetry.",
-  "target_vms": ["sensor-vm", "victim-linux", "windows-victim"],
+  "target_vms": ["victim-linux", "windows-victim"],
   "caldera": {
     "adversary_id": null,
     "group": "red",

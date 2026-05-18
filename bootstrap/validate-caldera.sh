@@ -3,7 +3,7 @@
 # Read-only — does not start or install CALDERA.
 #
 # Usage:
-#   ./bootstrap/validate-caldera.sh [--json]
+#   ./bootstrap/validate-caldera.sh [--json] [--wait] [--timeout SECONDS]
 #
 # Exit codes:
 #   0   all checks passed
@@ -14,6 +14,7 @@
 #   8   /opt/caldera/server.py missing
 #   10  caldera.service not active (or auto-restart loop)
 #   20  configured port not listening
+#   25  CALDERA still starting/building after wait timeout
 #   30  local HTTP probe failed
 #   35  CALDERA HTTP reachable but REST API not authenticated (GET /api/agents)
 #   40  HTTP probe via lab gateway failed
@@ -28,9 +29,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/_runtime-validation-lib.sh"
 
 JSON_MODE=0
+WAIT_MODE=0
+WAIT_TIMEOUT_SECS="${XDR_LAB_CALDERA_READY_TIMEOUT_SECS}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --json) JSON_MODE=1 ;;
+    --wait) WAIT_MODE=1 ;;
+    --timeout)
+      shift
+      if [[ $# -eq 0 ]]; then
+        rv_log ERROR "--timeout requires a value"
+        exit 2
+      fi
+      if ! [[ "$1" =~ ^[0-9]+$ ]] || [[ "$1" -eq 0 ]]; then
+        rv_log ERROR "invalid --timeout value: $1"
+        exit 2
+      fi
+      WAIT_TIMEOUT_SECS="$1"
+      ;;
     -h|--help)
       sed -n '1,22p' "$0" | tail -n +2
       exit 0
@@ -67,7 +83,30 @@ http_probe_reachable() {
   [[ "${code}" =~ ^(200|302|401|403)$ ]]
 }
 
-rv_log INFO "validate-caldera start home=${CALDERA_HOME} bind_host=${BIND_HOST} base_url=${BASE_URL} agent_base_url=${AGENT_BASE_URL} port=${PORT}"
+wait_for_caldera_if_requested() {
+  local line wait_rc=0
+  if [[ "${WAIT_MODE}" -eq 0 ]]; then
+    return 0
+  fi
+  rv_log INFO "validate-caldera wait enabled timeout=${WAIT_TIMEOUT_SECS}s (startup/build grace supported)"
+  set +e
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] && rv_log INFO "validate-caldera wait: ${line}"
+  done < <(rv_caldera_wait_ready "${WAIT_TIMEOUT_SECS}")
+  wait_rc=$?
+  set -e
+  if [[ "${wait_rc}" -ne 0 ]]; then
+    rv_log WARN "validate-caldera wait finished without HTTP READY (rc=${wait_rc}); continuing with diagnostics"
+  fi
+  return "${wait_rc}"
+}
+
+rv_log INFO "validate-caldera start home=${CALDERA_HOME} bind_host=${BIND_HOST} base_url=${BASE_URL} agent_base_url=${AGENT_BASE_URL} port=${PORT} wait=${WAIT_MODE} timeout=${WAIT_TIMEOUT_SECS}"
+
+WAIT_FAILED=0
+if ! wait_for_caldera_if_requested; then
+  WAIT_FAILED=1
+fi
 
 # (a) service file exists
 if [[ -f "${UNIT_PATH}" ]]; then
@@ -223,7 +262,9 @@ else
   record http_via_gateway 0 "HTTP probe failed for $(rv_url_join_path "${gw_url}" api/agents) (guests may not reach CALDERA)" 40
 fi
 
-if [[ "${#FAIL_CODES[@]}" -gt 1 ]]; then
+if [[ "${WAIT_FAILED}" -eq 1 && "${#FAIL_CODES[@]}" -gt 0 ]]; then
+  OVERALL_RC="${RV_EXIT_CALDERA_NOT_READY}"
+elif [[ "${#FAIL_CODES[@]}" -gt 1 ]]; then
   OVERALL_RC=50
 elif [[ "${#FAIL_CODES[@]}" -eq 1 ]]; then
   OVERALL_RC="${FAIL_CODES[0]}"

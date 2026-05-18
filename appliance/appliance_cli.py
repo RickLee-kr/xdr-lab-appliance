@@ -101,7 +101,7 @@ Core VM lifecycle:
   vm repair <vm> [--dry-run]
 
 Validation:
-  validate --strict [--wait] [--timeout SECONDS] [--dry-run]   (baseline: validate-appliance --strict)
+  validate --strict [--wait] [--timeout SECONDS] [--repair] [--dry-run]   (baseline: validate-appliance --strict)
   validate [vm|all] [--dry-run]   (legacy VM checks; default: all)
 
 OVS mirror (delegates to xdr-lab-vm-manager.sh mirror):
@@ -148,11 +148,15 @@ MITRE CALDERA (BAS / adversary emulation; state: runtime/state/scenario.json, ca
   scenario bootstrap validate [--json] [--dry-run]
   scenario atomic validate [--json] [--dry-run]
   scenario pack validate [--json] [--dry-run]
-  scenario run <NAME> [--snapshot-before] [--dry-run]   # NAME: scenario_id from `scenario list`
+  scenario run <NAME> [--snapshot-before] [--repair-mirror] [--dry-run]   # NAME: scenario_id from `scenario list`
   scenario stop [--dry-run]
   scenario status [--human] [--dry-run]
   scenario telemetry <NAME|last|verify> [--json] [--dry-run]
   scenario agent status|deploy|remove [--dry-run]
+
+Runtime-managed tools:
+  atomic install|verify|update [--dry-run]
+  tools list|verify [--dry-run]
 
 Runtime visibility (read-only; delegates to caldera_orchestration.py runtime):
   runtime summary [--json] [--dry-run]
@@ -734,18 +738,20 @@ def lab_status_callback(argv: List[str], *, dry_run: bool) -> int:
 
 @log_command
 def lab_validate_callback(argv: List[str], *, dry_run: bool) -> int:
-    tokens, seen = _strip_flags(list(argv), ("--dry-run", "--strict", "--wait"))
+    tokens, seen = _strip_flags(list(argv), ("--dry-run", "--strict", "--wait", "--repair"))
     dry_run = dry_run or seen["--dry-run"]
     if seen["--strict"]:
         args = ["--strict"]
         if seen["--wait"]:
             args.append("--wait")
+        if seen["--repair"]:
+            args.append("--repair")
         if tokens:
             if len(tokens) == 2 and tokens[0] == "--timeout" and tokens[1].isdigit():
                 args.extend(tokens)
             else:
                 print(
-                    "Usage: aella_cli lab validate --strict [--wait] [--timeout SECONDS] [--dry-run]",
+                    "Usage: aella_cli lab validate --strict [--wait] [--timeout SECONDS] [--repair] [--dry-run]",
                     file=sys.stderr,
                 )
                 return 2
@@ -850,6 +856,26 @@ def lab_agent_callback(argv: List[str], *, dry_run: bool) -> int:
     if json_only:
         cmd.append("--json")
     return _lab_invoke_script_caldera_dry(cmd, dry_run=dry_run)
+
+
+@log_command
+def lab_atomic_callback(argv: List[str], *, dry_run: bool) -> int:
+    tokens, seen = _strip_flags(list(argv), ("--dry-run",))
+    dry_run = dry_run or seen["--dry-run"]
+    if len(tokens) != 1 or tokens[0] not in ("install", "verify", "update"):
+        print("Usage: aella_cli lab atomic install|verify|update [--dry-run]", file=sys.stderr)
+        return 2
+    return _lab_invoke_script_engine_dry(["atomic", tokens[0]], dry_run=dry_run)
+
+
+@log_command
+def lab_tools_callback(argv: List[str], *, dry_run: bool) -> int:
+    tokens, seen = _strip_flags(list(argv), ("--dry-run",))
+    dry_run = dry_run or seen["--dry-run"]
+    if len(tokens) != 1 or tokens[0] not in ("list", "verify"):
+        print("Usage: aella_cli lab tools list|verify [--dry-run]", file=sys.stderr)
+        return 2
+    return _lab_invoke_script_engine_dry(["tools", tokens[0]], dry_run=dry_run)
 
 
 @log_command
@@ -1054,7 +1080,7 @@ def lab_scenario_callback(argv: List[str], *, dry_run: bool) -> int:
             "       aella_cli lab scenario bootstrap validate [--json] [--dry-run]\n"
             "       aella_cli lab scenario atomic validate [--json] [--dry-run]\n"
             "       aella_cli lab scenario pack validate [--json] [--dry-run]\n"
-            "       aella_cli lab scenario run <NAME> [--snapshot-before] [--dry-run]  "
+            "       aella_cli lab scenario run <NAME> [--snapshot-before] [--repair-mirror] [--dry-run]  "
             "(NAME is the scenario_id from `scenario list`)\n"
             "       aella_cli lab scenario stop [--dry-run]\n"
             "       aella_cli lab scenario status [--human] [--dry-run]\n"
@@ -1176,7 +1202,7 @@ def lab_scenario_callback(argv: List[str], *, dry_run: bool) -> int:
     if head == "run":
         if not rest:
             print(
-                "Usage: aella_cli lab scenario run <NAME> [--snapshot-before] [--dry-run]  "
+                "Usage: aella_cli lab scenario run <NAME> [--snapshot-before] [--repair-mirror] [--dry-run]  "
                 "(NAME is the scenario_id from `lab scenario list` — pack or caldera-lab.json)",
                 file=sys.stderr,
             )
@@ -1184,9 +1210,12 @@ def lab_scenario_callback(argv: List[str], *, dry_run: bool) -> int:
         name = rest[0]
         tail = rest[1:]
         snap = False
+        repair_mirror = False
         for t in tail:
             if t == "--snapshot-before":
                 snap = True
+            elif t == "--repair-mirror":
+                repair_mirror = True
             elif t == "--dry-run":
                 pass
             else:
@@ -1195,6 +1224,8 @@ def lab_scenario_callback(argv: List[str], *, dry_run: bool) -> int:
         cmd = ["scenario", "run", name]
         if snap:
             cmd.append("--snapshot-before")
+        if repair_mirror:
+            cmd.append("--repair-mirror")
         return _lab_invoke_script_caldera_dry(cmd, dry_run=dry_run)
     if head == "agent":
         if not rest:
@@ -1307,6 +1338,8 @@ def do_lab(argv: List[str]) -> int:
         "sensor": lab_sensor_callback,
         "vm": lab_vm_callback,
         "agent": lab_agent_callback,
+        "atomic": lab_atomic_callback,
+        "tools": lab_tools_callback,
         "debug": lab_debug_callback,
     }
     fn_multi = lab_multi.get(head)

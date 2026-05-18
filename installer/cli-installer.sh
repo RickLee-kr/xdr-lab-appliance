@@ -12,6 +12,7 @@
 #   scripts/nat_state.py
 #   scripts/snapshot_state.py
 #   scripts/caldera_orchestration.py
+#   scripts/tool_runtime_manager.py
 #   scripts/image_download_manager.py
 #   scripts/windows_lab_helpers.sh
 #   scripts/vnc_proxy_helpers.sh
@@ -19,6 +20,7 @@
 #   config/paths.sh                 <-- installed to ${XDR_ROOT}/config/
 #   config/lab-vms.json             <-- installed to ${XDR_ROOT}/config/
 #   config/images-manifest.json     <-- installed to ${XDR_ROOT}/config/
+#   config/tool-runtime.json        <-- installed to ${XDR_ROOT}/config/
 
 set -euo pipefail
 
@@ -37,6 +39,7 @@ APP_DIR="${PROJECT_ROOT}/appliance"
 SRC_SCRIPTS="${PROJECT_ROOT}/scripts"
 SRC_CONFIG="${PROJECT_ROOT}/config"
 SRC_BOOTSTRAP="${PROJECT_ROOT}/bootstrap"
+SRC_SCENARIOS="${PROJECT_ROOT}/scenarios"
 CLI_VENV_DIR="${CLI_VENV_DIR:-${XDR_ROOT}/venv}"
 CLI_INSTALL_MODE="${CLI_INSTALL_MODE:-venv}"  # venv | pipx | system (legacy; PEP668 may block)
 
@@ -55,9 +58,11 @@ mkdir -p \
   "${XDR_ROOT}/images" \
   "${XDR_ROOT}/scripts" \
   "${XDR_ROOT}/config" \
+  "${XDR_ROOT}/scenarios" \
   "${XDR_ROOT}/bootstrap" \
   "${XDR_ROOT}/runtime" \
   "${XDR_ROOT}/runtime/state" \
+  "${XDR_ROOT}/runtime/tools" \
   "${XDR_ROOT}/runtime/vnc-proxy" \
   "${XDR_ROOT}/runtime/web-console" \
   "${XDR_ROOT}/installer" \
@@ -68,11 +73,13 @@ install -m 0644 "${SRC_CONFIG}/paths.sh"              "${XDR_ROOT}/config/paths.
 install -m 0644 "${SRC_CONFIG}/lab-vms.json"          "${XDR_ROOT}/config/lab-vms.json"
 install -m 0644 "${SRC_CONFIG}/images-manifest.json"  "${XDR_ROOT}/config/images-manifest.json"
 install -m 0644 "${SRC_CONFIG}/caldera-lab.json"      "${XDR_ROOT}/config/caldera-lab.json"
+install -m 0644 "${SRC_CONFIG}/tool-runtime.json"     "${XDR_ROOT}/config/tool-runtime.json"
 install -m 0644 "${SRC_SCRIPTS}/vm_runtime_state.py"   "${XDR_ROOT}/scripts/vm_runtime_state.py"
 install -m 0644 "${SRC_SCRIPTS}/ovs_mirror_state.py"   "${XDR_ROOT}/scripts/ovs_mirror_state.py"
 install -m 0644 "${SRC_SCRIPTS}/nat_state.py"          "${XDR_ROOT}/scripts/nat_state.py"
 install -m 0644 "${SRC_SCRIPTS}/snapshot_state.py"     "${XDR_ROOT}/scripts/snapshot_state.py"
 install -m 0644 "${SRC_SCRIPTS}/caldera_orchestration.py" "${XDR_ROOT}/scripts/caldera_orchestration.py"
+install -m 0644 "${SRC_SCRIPTS}/tool_runtime_manager.py" "${XDR_ROOT}/scripts/tool_runtime_manager.py"
 install -m 0644 "${SRC_SCRIPTS}/image_download_manager.py" "${XDR_ROOT}/scripts/image_download_manager.py"
 install -m 0644 "${SRC_SCRIPTS}/caldera_api_key_resolve.py" "${XDR_ROOT}/scripts/caldera_api_key_resolve.py"
 install -m 0644 "${SRC_SCRIPTS}/caldera_api_key_util.py" "${XDR_ROOT}/scripts/caldera_api_key_util.py"
@@ -115,16 +122,56 @@ for _rv_script in \
   install -m 0755 "${SRC_BOOTSTRAP}/${_rv_script}" "${XDR_ROOT}/bootstrap/${_rv_script}"
 done
 
+verify_installed_mirror_asset() {
+  local src="$1" dst="$2"
+  if [[ ! -f "${dst}" ]]; then
+    echo "ERROR: required mirror diagnostics asset missing after install: ${dst}" >&2
+    exit 1
+  fi
+  if ! cmp -s "${src}" "${dst}"; then
+    echo "ERROR: installed mirror diagnostics asset differs from source: ${dst}" >&2
+    exit 1
+  fi
+  echo "Installed mirror diagnostics asset: ${dst}"
+}
+
+verify_installed_mirror_asset "${SRC_SCRIPTS}/ovs_mirror_state.py" "${XDR_ROOT}/scripts/ovs_mirror_state.py"
+verify_installed_mirror_asset "${SRC_SCRIPTS}/xdr-lab-vm-manager.sh" "${XDR_ROOT}/scripts/xdr-lab-vm-manager.sh"
+verify_installed_mirror_asset "${SRC_SCRIPTS}/caldera_orchestration.py" "${XDR_ROOT}/scripts/caldera_orchestration.py"
+verify_installed_mirror_asset "${SRC_BOOTSTRAP}/_runtime-validation-lib.sh" "${XDR_ROOT}/bootstrap/_runtime-validation-lib.sh"
+verify_installed_mirror_asset "${SRC_BOOTSTRAP}/validate-ovs-mirror.sh" "${XDR_ROOT}/bootstrap/validate-ovs-mirror.sh"
+verify_installed_mirror_asset "${SRC_BOOTSTRAP}/ensure-ovs-mirror.sh" "${XDR_ROOT}/bootstrap/ensure-ovs-mirror.sh"
+
+if [[ -d "${SRC_SCENARIOS}" ]]; then
+  find "${XDR_ROOT}/scenarios" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' \) -delete
+  find "${SRC_SCENARIOS}" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' \) -print0 \
+    | while IFS= read -r -d '' _scenario; do
+        install -m 0644 "${_scenario}" "${XDR_ROOT}/scenarios/$(basename "${_scenario}")"
+      done
+fi
+
+for _atomic_script in \
+  atomic-red-team-linux.sh \
+  atomic-red-team-windows.ps1; do
+  if [[ -f "${SRC_BOOTSTRAP}/${_atomic_script}" ]]; then
+    install -m 0755 "${SRC_BOOTSTRAP}/${_atomic_script}" "${XDR_ROOT}/bootstrap/${_atomic_script}"
+  fi
+done
+
 install -m 0644 "${PROJECT_ROOT}/installer/99-xdr-lab-ip-forward.conf" \
   /etc/sysctl.d/99-xdr-lab-ip-forward.conf
 sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-xdr-lab-ip-forward.conf >/dev/null 2>&1 || true
 
-install -m 0644 "${PROJECT_ROOT}/installer/caldera.service" \
-  /etc/systemd/system/caldera.service.tmp
-sed "s|/opt/xdr-lab|${XDR_ROOT}|g" \
-  /etc/systemd/system/caldera.service.tmp \
-  > /etc/systemd/system/caldera.service
-rm -f /etc/systemd/system/caldera.service.tmp
+if [[ ! -f /etc/systemd/system/caldera.service ]]; then
+  install -m 0644 "${PROJECT_ROOT}/installer/caldera.service" \
+    /etc/systemd/system/caldera.service.tmp
+  sed "s|/opt/xdr-lab|${XDR_ROOT}|g" \
+    /etc/systemd/system/caldera.service.tmp \
+    > /etc/systemd/system/caldera.service
+  rm -f /etc/systemd/system/caldera.service.tmp
+else
+  echo "Existing caldera.service preserved; bootstrap/repair-caldera-service.sh owns CALDERA unit reconciliation."
+fi
 
 install -m 0644 "${PROJECT_ROOT}/installer/xdr-lab-host-network.service" \
   /etc/systemd/system/xdr-lab-host-network.service.tmp
@@ -147,9 +194,9 @@ ensure_xdr_lab_group() {
 configure_group_tree_writable() {
   local _dir
   ensure_xdr_lab_group
-  chown -R root:root "${XDR_ROOT}/config" "${XDR_ROOT}/scripts" "${XDR_ROOT}/bootstrap" "${XDR_ROOT}/installer"
-  chmod 0755 "${XDR_ROOT}/config" "${XDR_ROOT}/scripts" "${XDR_ROOT}/bootstrap" "${XDR_ROOT}/installer"
-  for _dir in "${XDR_ROOT}/logs" "${XDR_ROOT}/runtime" "${XDR_ROOT}/runtime/state" "${XDR_ROOT}/images"; do
+  chown -R root:root "${XDR_ROOT}/config" "${XDR_ROOT}/scripts" "${XDR_ROOT}/bootstrap" "${XDR_ROOT}/installer" "${XDR_ROOT}/scenarios"
+  chmod 0755 "${XDR_ROOT}/config" "${XDR_ROOT}/scripts" "${XDR_ROOT}/bootstrap" "${XDR_ROOT}/installer" "${XDR_ROOT}/scenarios"
+  for _dir in "${XDR_ROOT}/logs" "${XDR_ROOT}/runtime" "${XDR_ROOT}/runtime/state" "${XDR_ROOT}/runtime/tools" "${XDR_ROOT}/images"; do
     chown root:"${XDR_LAB_GROUP}" "${_dir}"
     chmod 2775 "${_dir}"
     if command -v setfacl >/dev/null 2>&1; then
@@ -242,12 +289,17 @@ install_systemd_unit() {
 install_systemd_unit xdr-lab-host-network.service
 
 if [[ -f /opt/caldera/server.py ]]; then
+  CALDERA_RUNTIME_CHANGED=0
   id -u caldera >/dev/null 2>&1 || useradd --system --home-dir /opt/caldera --create-home --shell /bin/bash caldera 2>/dev/null || true
   "${XDR_ROOT}/bootstrap/ensure-caldera-runtime.sh" \
     || echo "WARN: ensure-caldera-runtime failed; run sudo ${XDR_ROOT}/bootstrap/deploy-caldera-runtime-fix.sh" >&2
+  if [[ -f /opt/caldera/.venv/.xdr-lab-runtime-changed ]]; then
+    CALDERA_RUNTIME_CHANGED="$(tr -d '\n\r' </opt/caldera/.venv/.xdr-lab-runtime-changed 2>/dev/null || echo 0)"
+  fi
   "${XDR_ROOT}/bootstrap/ensure-caldera-api-key.sh" --wait \
     || echo "WARN: ensure-caldera-api-key failed; run sudo ${XDR_ROOT}/bootstrap/ensure-caldera-api-key.sh --wait" >&2
-  "${XDR_ROOT}/bootstrap/repair-caldera-service.sh" --start \
+  XDR_LAB_CALDERA_RUNTIME_CHANGED="${CALDERA_RUNTIME_CHANGED}" \
+    "${XDR_ROOT}/bootstrap/repair-caldera-service.sh" --start \
     || echo "WARN: repair-caldera-service failed; inspect journalctl -u caldera.service" >&2
 fi
 

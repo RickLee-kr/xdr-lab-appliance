@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "atomic": {
+    "enabled": true,
+    "managed": true,
+    "install_path": "/opt/xdr-lab/runtime/tools/atomic-red-team",
+    "repo_url": "https://github.com/redcanaryco/atomic-red-team.git"
+  },
+  "caldera": {
+    "enabled": true,
+    "managed": true,
+    "install_path": "/opt/caldera"
+  },
+  "sliver": {
+    "enabled": false,
+    "install_path": "/opt/xdr-lab/runtime/tools/sliver",
+    "server_port": 31337
+  }
+}

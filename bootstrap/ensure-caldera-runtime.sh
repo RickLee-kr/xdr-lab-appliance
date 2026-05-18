@@ -38,6 +38,7 @@ CALDERA_HOME="$(rv_caldera_home)"
 SERVER_PY="${CALDERA_HOME}/server.py"
 VENV_PY="${CALDERA_HOME}/.venv/bin/python3"
 REQ_FILE="${CALDERA_HOME}/requirements.txt"
+RUNTIME_CHANGED=0
 RUNTIME_USER=""
 
 rv_log INFO "ensure-caldera-runtime start home=${CALDERA_HOME}"
@@ -110,6 +111,7 @@ rv_step_end "verify python3 venv module" 0
 
 rv_step_begin "verify venv python"
 if [[ ! -x "${VENV_PY}" ]]; then
+  RUNTIME_CHANGED=1
   rv_log INFO "creating venv at ${CALDERA_HOME}/.venv"
   if ! run_as_runtime "${XDR_LAB_VENV_TIMEOUT_SECS}" "python3 -m venv" \
       "python3 -m venv '${CALDERA_HOME}/.venv'"; then
@@ -124,6 +126,23 @@ if [[ ! -x "${VENV_PY}" ]]; then
   exit 5
 fi
 rv_step_end "verify venv python" 0
+
+REQ_STAMP="${CALDERA_HOME}/.venv/.xdr-lab-requirements.sha256"
+REQ_CHANGED_FLAG="${CALDERA_HOME}/.venv/.xdr-lab-runtime-changed"
+current_req_hash=""
+previous_req_hash=""
+if [[ -f "${REQ_FILE}" ]]; then
+  current_req_hash="$(sha256sum "${REQ_FILE}" | awk '{print $1}')"
+  if [[ -f "${REQ_STAMP}" ]]; then
+    previous_req_hash="$(tr -d '\n\r' <"${REQ_STAMP}" 2>/dev/null || true)"
+    if [[ -n "${previous_req_hash}" && "${previous_req_hash}" != "${current_req_hash}" ]]; then
+      RUNTIME_CHANGED=1
+      rv_log INFO "requirements.txt changed since last successful runtime ensure"
+    fi
+  else
+    rv_log INFO "requirements stamp missing — initializing after successful install"
+  fi
+fi
 
 rv_step_begin "upgrade pip setuptools wheel"
 if ! run_as_runtime "${XDR_LAB_PIP_TIMEOUT_SECS}" "pip bootstrap" \
@@ -148,5 +167,10 @@ if ! run_as_runtime "${XDR_LAB_PIP_TIMEOUT_SECS}" "pip install requirements" \
 fi
 rv_step_end "install requirements.txt" 0
 
-rv_log INFO "ensure-caldera-runtime finished ok user=${RUNTIME_USER} venv=${VENV_PY}"
+if [[ -n "${current_req_hash}" ]]; then
+  printf '%s\n' "${current_req_hash}" >"${REQ_STAMP}" 2>/dev/null || true
+fi
+printf '%s\n' "${RUNTIME_CHANGED}" >"${REQ_CHANGED_FLAG}" 2>/dev/null || true
+
+rv_log INFO "ensure-caldera-runtime finished ok user=${RUNTIME_USER} venv=${VENV_PY} runtime_changed=${RUNTIME_CHANGED}"
 exit 0

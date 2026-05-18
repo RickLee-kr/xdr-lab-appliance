@@ -464,8 +464,15 @@ web_console_start() {
   local old_pid
   old_pid="$(xdr_vnc_manifest_read_field "$mf" websockify_pid)"
   if [[ -n "$old_pid" ]] && xdr_pid_alive "$old_pid"; then
-    log_structured "INFO" "web_console_start_idempotent vm=${vm} pid=${old_pid}"
-    return 0
+    local old_target old_listen
+    old_target="$(xdr_vnc_manifest_read_field "$mf" target_port)"
+    old_listen="$(xdr_vnc_manifest_read_field "$mf" listen_port)"
+    if [[ "$old_target" == "$vnc_port" && "$old_listen" == "$lport" ]]; then
+      log_structured "INFO" "web_console_start_idempotent vm=${vm} pid=${old_pid}"
+      return 0
+    fi
+    kill "$old_pid" 2>/dev/null || true
+    log_structured "INFO" "web_console_restarting_stale vm=${vm} pid=${old_pid} old_target=${old_target:-} new_target=${vnc_port} old_listen=${old_listen:-} new_listen=${lport}"
   fi
 
   if dry_run_active; then

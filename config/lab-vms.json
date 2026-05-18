@@ -11,6 +11,10 @@
   "vms": {
     "sensor-vm": {
       "name": "sensor-vm",
+      "role": "observer",
+      "observer_only": true,
+      "requires_agent": false,
+      "requires_caldera_agent": false,
       "type": "sensor",
       "sensor_type": "stellar_sensor",
       "hostname": "sensor-vm",
@@ -67,6 +71,10 @@
     },
     "windows-victim": {
       "name": "windows-victim",
+      "role": "attack_target",
+      "observer_only": false,
+      "requires_agent": true,
+      "requires_caldera_agent": true,
       "type": "windows",
       "image_url": "https://REPLACE_ME.example.invalid/xdr-lab/windows-victim.qcow2",
       "bridge": "br0",
@@ -85,6 +93,10 @@
     },
     "victim-linux": {
       "name": "victim-linux",
+      "role": "attack_target",
+      "observer_only": false,
+      "requires_agent": true,
+      "requires_caldera_agent": true,
       "type": "linux",
       "image_url": "https://REPLACE_ME.example.invalid/xdr-lab/victim-linux.qcow2",
       "bridge": "br0",
@@ -101,6 +113,10 @@
     },
     "test-vm1": {
       "name": "test-vm1",
+      "role": "utility",
+      "observer_only": false,
+      "requires_agent": false,
+      "requires_caldera_agent": false,
       "type": "linux",
       "image_url": "https://REPLACE_ME.example.invalid/xdr-lab/test-vm1.qcow2",
       "bridge": "br0",
