@@ -60,7 +60,7 @@ read-only probes, not arbitrary operator `iptables` tables.
 | Step | Command / action | Pass criteria |
 | --- | --- | --- |
 | Summary | `aella_cli lab access` | Port map matches `README.md` §5.1 golden matrix |
-| SSH paths | From a workstation: `ssh -p 1022 sensor@<EXT>`, `ssh -p 2022 ubuntu@<EXT>` | Login succeeds when guests are up |
+| SSH paths | From a workstation: `ssh -p 1022 sensor@<EXT>`, `ssh -p 2022 labuser@<EXT>` (password `lab1234`) | Login succeeds when guests are up |
 | RDP | Client to `<EXT>:3389` | Session to `windows-victim` when VM is running |
 
 ---

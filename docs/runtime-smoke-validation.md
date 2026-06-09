@@ -37,6 +37,7 @@ installed):
 
 ```bash
 command -v shellcheck >/dev/null 2>&1 && shellcheck -x scripts/xdr-lab-vm-manager.sh scripts/create-cloud-vm.sh installer/cli-installer.sh bootstrap/caldera-server-bootstrap.sh bootstrap/atomic-red-team-linux.sh || true
+bash tests/test_victim_linux_cloudinit.sh
 ```
 
 **Pass:** no errors (warnings are team policy). If `shellcheck` is absent,

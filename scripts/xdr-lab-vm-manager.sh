@@ -91,7 +91,7 @@ fi
 # Windows golden qcow2 cache + UEFI/NVRAM policy (overridable via config/paths.sh).
 : "${XDR_LAB_WINDOWS_IMAGES_DIR:=${XDR_IMAGES_DIR}/windows}"
 : "${XDR_LAB_WINDOWS_RECREATE_NVRAM:=0}"
-: "${XDR_LAB_WINDOWS_SSH_USER:=lab}"
+: "${XDR_LAB_WINDOWS_SSH_USER:=labuser}"
 : "${XDR_LAB_WINDOWS_NET_MODEL:=e1000}"
 
 # Golden image manifest (sensor-vm / victim-linux / windows-victim). Optional: when
@@ -109,15 +109,24 @@ readonly VICTIM_LINUX_CLOUD_IMAGE_URL="${VICTIM_LINUX_CLOUD_IMAGE_URL:-https://c
 readonly VICTIM_LINUX_CLOUD_IMAGE_BASENAME="ubuntu-24.04-server-cloudimg-amd64.img"
 # Operator contract: lab bridge static address for victim-linux (override for air-gapped tests).
 readonly VICTIM_LINUX_MATERIALIZED_IP="${VICTIM_LINUX_MATERIALIZED_IP:-10.10.10.20}"
-readonly VICTIM_LINUX_SSH_USER="${VICTIM_LINUX_SSH_USER:-ubuntu}"
-# SSH validation tries these usernames in order (override via env as space-separated list).
-readonly LINUX_SERVER_SSH_USER_CANDIDATES="${LINUX_SERVER_SSH_USER_CANDIDATES:-ubuntu lab}"
-# Set by validate_ssh_connectivity on success.
+readonly VICTIM_LINUX_SSH_USER="${VICTIM_LINUX_SSH_USER:-labuser}"
+readonly VICTIM_CREDENTIAL_USER="${VICTIM_CREDENTIAL_USER:-labuser}"
+: "${VICTIM_LINUX_PASSWORD:=lab1234}"
+: "${VICTIM_LINUX_SSH_PASSWORD_USER:=labuser}"
+# SSH key validation tries these usernames in order (override via env as space-separated list).
+# Victim-linux key SSH validation accepts only labuser (never ubuntu/lab legacy accounts).
+readonly LINUX_SERVER_SSH_USER_CANDIDATES="${LINUX_SERVER_SSH_USER_CANDIDATES:-labuser}"
+# Set by validate_ssh_connectivity / validate_linux_server_password_ssh on success.
 LINUX_SERVER_SSH_VALIDATED_USER=""
+LINUX_SERVER_SSH_PASSWORD_LAST_STDERR=""
+LINUX_SERVER_SSH_AUTH_LAST_STDERR=""
 # SSH validation identity / known_hosts (override via env).
 : "${XDR_LAB_VICTIM_LINUX_SSH_IDENTITY:=}"
 : "${XDR_LAB_SSH_USER_KNOWN_HOSTS_FILE:=}"
-: "${XDR_LAB_SSH_VALIDATION_TIMEOUT:=120}"
+: "${XDR_LAB_SSH_VALIDATION_TIMEOUT:=300}"
+: "${XDR_LAB_VICTIM_LINUX_SSH_RETRY_INTERVAL:=5}"
+: "${XDR_LAB_VICTIM_LINUX_FORCE_REDEPLOY:=0}"
+: "${XDR_LAB_VICTIM_LINUX_CLOUD_INIT_CLEAN:=0}"
 
 # Windows emergency VNC — host socat forward (QEMU stays 127.0.0.1-only).
 : "${XDR_LAB_VNC_PROXY_DIR:=${XDR_RUNTIME_DIR}/vnc-proxy}"
@@ -1609,7 +1618,7 @@ windows_emit_deploy_failure_diagnostics() {
   fi
   echo "try:"
   echo "  virsh console ${vm}"
-  echo "  ssh lab@${ip:-10.10.10.30}"
+  echo "  ssh labuser@${ip:-10.10.10.30}"
   echo ""
   log_structured "WARN" "windows_deploy_failure_preserved vm=${vm} reason=${reason} run_vm=${run_vm}"
 }
@@ -2325,17 +2334,55 @@ download_linux_server_cloud_base() {
   if manifest_enabled && manifest_has_role "victim-linux"; then
     if [[ -f "$dest" ]]; then
       log_structured "INFO" "download_linux_server_cloud_manifest_ok path=${dest}"
+      linux_server_prepare_victim_linux_base_image "$dest"
       return 0
     fi
     die "Missing Ubuntu cloud base image at ${dest} (enable manifest sync / lab download victim-linux first)"
   fi
   if [[ -f "$dest" ]]; then
     log_structured "INFO" "download_linux_server_cloud_cache_hit path=${dest}"
+    linux_server_prepare_victim_linux_base_image "$dest"
     return 0
   fi
   log_structured "INFO" "download_linux_server_cloud_begin url=${VICTIM_LINUX_CLOUD_IMAGE_URL} dest=${dest}"
   download_to "${VICTIM_LINUX_CLOUD_IMAGE_URL}" "$dest"
   log_structured "INFO" "download_linux_server_cloud_end path=${dest}"
+  linux_server_prepare_victim_linux_base_image "$dest"
+}
+
+# Bake qemu-guest-agent into the Ubuntu cloud base (never via cloud-init packages:).
+linux_server_prepare_victim_linux_base_image() {
+  local dest="$1"
+  local marker="${dest}.xdr-lab-baked"
+  local sum=""
+  [[ -f "$dest" ]] || return 0
+  sum="$(sha256sum "$dest" | awk '{print $1}')"
+  if [[ -f "$marker" && "$(cat "$marker" 2>/dev/null)" == "$sum" ]]; then
+    log_structured "INFO" "linux_server_base_image_bake_cache_hit path=${dest}"
+    return 0
+  fi
+  if ! command -v virt-customize >/dev/null 2>&1; then
+    echo "WARNING: virt-customize missing; qemu-guest-agent not baked into base image." >&2
+    echo "  Install: sudo apt-get install -y guestfs-tools" >&2
+    echo "  Or bake manually: sudo virt-customize -a ${dest} --install qemu-guest-agent --run-command 'systemctl enable qemu-guest-agent'" >&2
+    log_structured "WARN" "linux_server_base_image_bake_skipped reason=virt_customize_missing path=${dest}"
+    return 0
+  fi
+  log_structured "INFO" "linux_server_base_image_bake_begin path=${dest}"
+  echo "=== victim-linux base image preparation (qemu-guest-agent bake-in) ==="
+  echo "  image: ${dest}"
+  if virt-customize -a "$dest" \
+    --install qemu-guest-agent \
+    --run-command 'systemctl enable qemu-guest-agent 2>/dev/null || true' \
+    --run-command 'DEBIAN_FRONTEND=noninteractive apt-get clean 2>/dev/null || true'; then
+    printf '%s\n' "$sum" >"$marker"
+    log_structured "INFO" "linux_server_base_image_bake_ok path=${dest}"
+    echo "INFO base_image_bake_ok packages=qemu-guest-agent"
+    return 0
+  fi
+  log_structured "WARN" "linux_server_base_image_bake_failed path=${dest}"
+  echo "WARNING: virt-customize bake failed (qemu-guest-agent may be missing; deploy still proceeds)" >&2
+  return 0
 }
 
 # Lab operator home — when invoked via sudo, prefer the invoking user's ~/.ssh.
@@ -2457,6 +2504,390 @@ linux_server_collect_ssh_pubkeys_file() {
   return 0
 }
 
+linux_server_wait_tcp_port() {
+  local ip="$1" port="${2:-22}" per_try_timeout="${3:-2}"
+  if ! declare -F xdr_tcp_open >/dev/null 2>&1; then
+    timeout "${per_try_timeout}" bash -c "echo >/dev/tcp/${ip}/${port}" 2>/dev/null
+    return $?
+  fi
+  xdr_tcp_open "$ip" "$port" "$per_try_timeout"
+}
+
+linux_server_qemu_agent_ping() {
+  local vm="$1"
+  local out
+  out="$(virsh qemu-agent-command "$vm" '{"execute":"guest-ping"}' 2>/dev/null || true)"
+  [[ "$out" == *'"return"'* ]]
+}
+
+linux_server_wait_qemu_guest_agent() {
+  local vm="$1" deadline="${2:-$((SECONDS + XDR_LAB_SSH_VALIDATION_TIMEOUT))}"
+  local interval="${XDR_LAB_VICTIM_LINUX_SSH_RETRY_INTERVAL:-5}"
+  log_structured "INFO" "linux_server_wait_qemu_guest_agent_begin vm=${vm}"
+  while (( SECONDS < deadline )); do
+    if linux_server_qemu_agent_ping "$vm"; then
+      log_structured "INFO" "linux_server_wait_qemu_guest_agent_ok vm=${vm}"
+      return 0
+    fi
+    sleep "$interval"
+  done
+  log_structured "ERROR" "linux_server_wait_qemu_guest_agent_failed vm=${vm}"
+  return 1
+}
+
+# Run guest command via qemu-guest-agent; returns 0 when guest exit code is 0.
+linux_server_guest_exec_run() {
+  local vm="$1"
+  shift
+  local -a cmd=("$@")
+  [[ ${#cmd[@]} -gt 0 ]] || return 1
+  if ! command -v virsh >/dev/null 2>&1 || ! vm_exists "$vm"; then
+    return 1
+  fi
+  if ! linux_server_qemu_agent_ping "$vm"; then
+    return 1
+  fi
+
+  local payload pid st_payload st_json exited exitcode
+  payload="$(python3 -c 'import json,sys; print(json.dumps({"execute":"guest-exec","arguments":{"path":sys.argv[1],"arg":sys.argv[2:],"capture-output":True}}))' \
+    -- "${cmd[@]}" 2>/dev/null)" || return 1
+  st_json="$(virsh qemu-agent-command "$vm" "$payload" 2>/dev/null || true)"
+  pid="$(printf '%s' "$st_json" | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin)
+  print(d.get("return",{}).get("pid",""))
+except Exception:
+  pass' 2>/dev/null || true)"
+  [[ -n "$pid" && "$pid" != "None" ]] || return 1
+
+  local poll_deadline=$((SECONDS + 180))
+  while (( SECONDS < poll_deadline )); do
+    st_payload="$(printf '{"execute":"guest-exec-status","arguments":{"pid":%s}}' "$pid")"
+    st_json="$(virsh qemu-agent-command "$vm" "$st_payload" 2>/dev/null || true)"
+    read -r exited exitcode < <(printf '%s' "$st_json" | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin).get("return",{})
+  print(1 if d.get("exited") else 0, int(d.get("exitcode", 1)))
+except Exception:
+  print(0, 1)' 2>/dev/null || echo "0 1")
+    if [[ "$exited" == "1" ]]; then
+      [[ "$exitcode" == "0" ]]
+      return
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+linux_server_guest_cloud_init_done() {
+  local vm="$1"
+  linux_server_guest_exec_run "$vm" /usr/bin/test -f /var/lib/cloud/instance/boot-finished
+}
+
+linux_server_wait_cloud_init_complete() {
+  local vm="$1" ip="$2" deadline="${3:-$((SECONDS + XDR_LAB_SSH_VALIDATION_TIMEOUT))}"
+  local interval="${XDR_LAB_VICTIM_LINUX_SSH_RETRY_INTERVAL:-5}"
+  log_structured "INFO" "linux_server_wait_cloud_init_complete_begin vm=${vm} ip=${ip}"
+
+  if linux_server_guest_exec_run "$vm" /usr/bin/cloud-init status --wait; then
+    log_structured "INFO" "linux_server_wait_cloud_init_complete_ok vm=${vm} via=guest_agent_exec"
+    return 0
+  fi
+
+  while (( SECONDS < deadline )); do
+    if linux_server_guest_cloud_init_done "$vm"; then
+      log_structured "INFO" "linux_server_wait_cloud_init_complete_ok vm=${vm} via=boot_finished"
+      return 0
+    fi
+    if command -v sshpass >/dev/null 2>&1 && linux_server_password_ssh "$ip" 'cloud-init status --wait' >/dev/null 2>&1; then
+      local st
+      st="$(linux_server_password_ssh "$ip" 'cloud-init status 2>/dev/null | head -1' 2>/dev/null || true)"
+      if [[ "$st" == *"done"* ]]; then
+        log_structured "INFO" "linux_server_wait_cloud_init_complete_ok vm=${vm} via=ssh"
+        return 0
+      fi
+    fi
+    sleep "$interval"
+  done
+  log_structured "ERROR" "linux_server_wait_cloud_init_complete_failed vm=${vm} ip=${ip}"
+  return 1
+}
+
+linux_server_guest_exec_capture() {
+  local vm="$1"
+  shift
+  local -a cmd=("$@")
+  local payload pid st_payload st_json out_b64
+  [[ ${#cmd[@]} -gt 0 ]] || return 1
+  linux_server_qemu_agent_ping "$vm" || return 1
+  payload="$(python3 -c 'import json,sys; print(json.dumps({"execute":"guest-exec","arguments":{"path":sys.argv[1],"arg":sys.argv[2:],"capture-output":True}}))' \
+    -- "${cmd[@]}" 2>/dev/null)" || return 1
+  st_json="$(virsh qemu-agent-command "$vm" "$payload" 2>/dev/null || true)"
+  pid="$(printf '%s' "$st_json" | python3 -c 'import json,sys
+try:
+  print(json.load(sys.stdin).get("return",{}).get("pid",""))
+except Exception:
+  pass' 2>/dev/null || true)"
+  [[ -n "$pid" && "$pid" != "None" ]] || return 1
+  local poll_deadline=$((SECONDS + 60)) exited=0 exitcode=1
+  while (( SECONDS < poll_deadline )); do
+    st_payload="$(printf '{"execute":"guest-exec-status","arguments":{"pid":%s}}' "$pid")"
+    st_json="$(virsh qemu-agent-command "$vm" "$st_payload" 2>/dev/null || true)"
+    read -r exited exitcode out_b64 < <(printf '%s' "$st_json" | python3 -c 'import json,sys,base64
+try:
+  d=json.load(sys.stdin).get("return",{})
+  o=d.get("out-data") or ""
+  print(1 if d.get("exited") else 0, int(d.get("exitcode", 1)), o)
+except Exception:
+  print(0, 1, "")' 2>/dev/null || echo "0 1 ")
+    if [[ "$exited" == "1" ]]; then
+      [[ "$exitcode" == "0" ]] || return 1
+      if [[ -n "$out_b64" ]]; then
+        printf '%s' "$out_b64" | base64 -d 2>/dev/null || printf '%s\n' "$out_b64"
+      fi
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+linux_server_collect_guest_cloud_init_logs() {
+  local vm="$1" ip="${2:-}"
+  local logf
+  echo ""
+  echo "=== guest cloud-init logs ==="
+  for logf in /var/log/cloud-init-output.log /var/log/cloud-init.log; do
+    echo "--- tail ${logf} (guest-agent) ---"
+    linux_server_guest_exec_capture "$vm" /usr/bin/tail -n 80 "$logf" 2>/dev/null | sed 's/^/  /' || echo "  (unavailable)"
+  done
+  if [[ -n "$ip" ]] && command -v sshpass >/dev/null 2>&1 && linux_server_wait_tcp_port "$ip" 22 2; then
+    if linux_server_password_ssh "$ip" "sudo tail -n 80 /var/log/cloud-init-output.log 2>/dev/null; echo '---'; sudo tail -n 80 /var/log/cloud-init.log 2>/dev/null" 2>/dev/null | sed 's/^/  /'; then
+      echo "(via SSH)"
+    fi
+  fi
+  echo ""
+}
+
+linux_server_virt_customize_cloud_init_clean() {
+  local disk="$1"
+  [[ -f "$disk" ]] || return 0
+  if command -v virt-customize >/dev/null 2>&1; then
+    log_structured "INFO" "linux_server_virt_customize_cloud_init_clean disk=${disk}"
+    virt-customize -a "$disk" --run-command 'cloud-init clean --logs || true' >/dev/null 2>&1 || \
+      log_structured "WARN" "linux_server_virt_customize_cloud_init_clean_failed disk=${disk}"
+    return 0
+  fi
+  if command -v guestfish >/dev/null 2>&1; then
+    log_structured "INFO" "linux_server_guestfish_cloud_init_clean disk=${disk}"
+    guestfish -a "$disk" -i <<'GF' >/dev/null 2>&1 || log_structured "WARN" "linux_server_guestfish_cloud_init_clean_failed disk=${disk}"
+run
+  : rm -rf /var/lib/cloud/instance /var/lib/cloud/instances /var/lib/cloud/data
+  : rm -f /var/lib/cloud/sem/config_scripts_user
+GF
+  fi
+}
+
+linux_server_redeploy_cleanup() {
+  local vm="$1" run_vm="$2" disk="$3" seed="$4"
+  log_structured "INFO" "linux_server_redeploy_cleanup_begin vm=${vm}"
+  if [[ -f "$disk" && "${XDR_LAB_VICTIM_LINUX_CLOUD_INIT_CLEAN:-0}" == "1" ]]; then
+    linux_server_virt_customize_cloud_init_clean "$disk"
+  fi
+  virsh destroy "$vm" >/dev/null 2>&1 || true
+  virsh undefine "$vm" --nvram >/dev/null 2>&1 || \
+    virsh undefine "$vm" --managed-save --snapshots-metadata >/dev/null 2>&1 || \
+    virsh undefine "$vm" >/dev/null 2>&1 || true
+  rm -f "$disk" "$seed" 2>/dev/null || true
+  log_structured "INFO" "linux_server_redeploy_cleanup_end vm=${vm} run_vm=${run_vm}"
+}
+
+linux_server_password_ssh() {
+  local ip="$1" remote_cmd="$2"
+  local user="${3:-${VICTIM_LINUX_SSH_PASSWORD_USER:-labuser}}"
+  local pass="${VICTIM_LINUX_PASSWORD:-lab1234}"
+  local errf outf rc=1
+  if ! command -v sshpass >/dev/null 2>&1; then
+    LINUX_SERVER_SSH_AUTH_LAST_STDERR="sshpass not installed"
+    return 1
+  fi
+  errf="$(mktemp)"
+  outf="$(mktemp)"
+  if sshpass -p "$pass" ssh \
+    -o StrictHostKeyChecking=no \
+    -o ConnectTimeout=10 \
+    -o PreferredAuthentications=password \
+    -o PubkeyAuthentication=no \
+    "${user}@${ip}" "${remote_cmd}" >"$outf" 2>"$errf"; then
+    cat "$outf"
+    rc=0
+  else
+    LINUX_SERVER_SSH_AUTH_LAST_STDERR="$(cat "$errf" 2>/dev/null || true)"
+    LINUX_SERVER_SSH_PASSWORD_LAST_STDERR="${LINUX_SERVER_SSH_AUTH_LAST_STDERR}"
+    rc=1
+  fi
+  rm -f "$errf" "$outf"
+  return "$rc"
+}
+
+linux_server_warn_guest_agent_optional() {
+  local vm="${1:-victim-linux}"
+  if linux_server_qemu_agent_ping "$vm"; then
+    log_structured "INFO" "qemu_guest_agent_ok vm=${vm}"
+    return 0
+  fi
+  echo "WARNING: qemu-guest-agent not connected for ${vm} (non-fatal; deploy continues)" >&2
+  log_structured "WARN" "qemu_guest_agent_not_connected vm=${vm}"
+  return 0
+}
+
+linux_server_wait_deploy_ready() {
+  local ip="$1" vm="${2:-victim-linux}"
+  local interval="${XDR_LAB_VICTIM_LINUX_SSH_RETRY_INTERVAL:-5}"
+  local deadline=$((SECONDS + XDR_LAB_SSH_VALIDATION_TIMEOUT))
+  local user="${VICTIM_LINUX_SSH_PASSWORD_USER:-labuser}"
+  local expected="${VICTIM_CREDENTIAL_USER:-labuser}"
+  log_structured "INFO" "linux_server_wait_deploy_ready_begin ip=${ip} vm=${vm} interval=${interval} timeout=${XDR_LAB_SSH_VALIDATION_TIMEOUT}"
+
+  if command -v ping >/dev/null 2>&1; then
+    if ping -c 1 -W 2 "$ip" >/dev/null 2>&1; then
+      log_structured "INFO" "linux_server_wait_deploy_ready_ping_ok ip=${ip}"
+    else
+      log_structured "WARN" "linux_server_wait_deploy_ready_ping_fail ip=${ip}"
+    fi
+  fi
+
+  while (( SECONDS < deadline )); do
+    if linux_server_wait_tcp_port "$ip" 22 2; then
+      break
+    fi
+    sleep "$interval"
+  done
+  if ! linux_server_wait_tcp_port "$ip" 22 2; then
+    log_structured "ERROR" "linux_server_wait_deploy_ready_failed ip=${ip} reason=tcp22_timeout"
+    return 1
+  fi
+  log_structured "INFO" "linux_server_wait_deploy_ready_tcp22_open ip=${ip}"
+
+  while (( SECONDS < deadline )); do
+    local out
+    if out="$(linux_server_password_ssh "$ip" 'whoami' "$user" 2>/dev/null)" && [[ "$out" == "$expected" ]]; then
+      LINUX_SERVER_SSH_VALIDATED_USER="$user"
+      log_structured "INFO" "linux_server_wait_deploy_ready_password_ssh_ok ip=${ip} user=${user} whoami=${out}"
+      echo "INFO ssh_validation_success user=${user}"
+      linux_server_warn_guest_agent_optional "$vm"
+      return 0
+    fi
+    sleep "$interval"
+  done
+
+  linux_server_collect_guest_cloud_init_logs "$vm" "$ip" || true
+  linux_server_emit_legacy_credential_warnings "$ip" "" ""
+  log_structured "ERROR" "linux_server_wait_deploy_ready_failed ip=${ip} reason=password_ssh_timeout user=${user}"
+  return 1
+}
+
+validate_linux_server_password_ssh() {
+  linux_server_require_sshpass || return 1
+  linux_server_wait_deploy_ready "$1" "${2:-victim-linux}"
+}
+
+validate_linux_server_deploy_ready() {
+  validate_linux_server_password_ssh "$@"
+}
+
+linux_server_emit_legacy_credential_warnings() {
+  local ip="${1:-}" ci_dir="${2:-}" context="${3:-deploy}"
+  local legacy_out
+
+  echo ""
+  echo "=== legacy credential compatibility (${context}) ==="
+  if [[ -n "$ci_dir" && -f "${ci_dir}/user-data" ]]; then
+    if grep -qE '(^|[[:space:]]+)name:[[:space:]]+lab$|plain_text_passwd' "${ci_dir}/user-data" 2>/dev/null; then
+      echo "WARNING: cloud-init user-data references legacy user 'lab' or plain_text_passwd."
+      echo "  Redeploy victim-linux with current chpasswd/labuser policy or recreate baseline snapshot."
+    fi
+  fi
+  if [[ -n "$ip" ]] && command -v sshpass >/dev/null 2>&1; then
+    if legacy_out="$(linux_server_password_ssh "$ip" 'whoami' "lab" 2>/dev/null)" && [[ "$legacy_out" == "lab" ]]; then
+      echo "WARNING: legacy login user 'lab' still works on ${ip} (expected labuser)."
+      echo "  Stale snapshot, seed ISO, or unredeployed disk may preserve old credentials."
+    fi
+    if ! linux_server_wait_tcp_port "$ip" 22 1; then
+      echo "WARNING: tcp/22 closed on ${ip}; cloud-init may still be running or network is wrong."
+    fi
+  fi
+  echo ""
+}
+
+linux_server_run_cloud_init_diagnostics() {
+  local ip="$1" vm="${2:-victim-linux}"
+  local user="${VICTIM_LINUX_SSH_PASSWORD_USER:-labuser}"
+  echo ""
+  echo "=== cloud-init diagnostics (${user}@${ip}) ==="
+  if command -v virsh >/dev/null 2>&1 && linux_server_qemu_agent_ping "$vm"; then
+    echo "qemu-guest-agent: responding"
+    virsh qemu-agent-command "$vm" '{"execute":"guest-info"}' 2>/dev/null | sed 's/^/  /' || true
+    echo ""
+  else
+    echo "  qemu-guest-agent: not responding"
+  fi
+  if ! command -v sshpass >/dev/null 2>&1; then
+    echo "  (skipped: sshpass not installed)"
+    return 0
+  fi
+  local remote_cmd
+  remote_cmd='cloud-init status 2>&1; echo "---"; cloud-init status --long 2>&1 || true; echo "---"; journalctl -u cloud-init --no-pager -n 100 2>&1 || true'
+  if linux_server_password_ssh "$ip" "$remote_cmd" 2>/dev/null | sed 's/^/  /'; then
+    echo ""
+    return 0
+  fi
+  echo "  (remote cloud-init diagnostics failed — non-fatal)"
+  linux_server_collect_guest_cloud_init_logs "$vm" "$ip" || true
+  if [[ -n "${LINUX_SERVER_SSH_AUTH_LAST_STDERR:-}" ]]; then
+    echo "  last auth stderr:"
+    printf '%s\n' "${LINUX_SERVER_SSH_AUTH_LAST_STDERR}" | sed 's/^/    /'
+  fi
+  echo ""
+  return 0
+}
+
+linux_server_pre_snapshot_validate() {
+  local vm="$1" ip="$2" expected_host="${3:-$vm}"
+  local out ip_seen host_seen who
+  local expected_user="${VICTIM_CREDENTIAL_USER:-labuser}"
+
+  echo "=== pre-snapshot credential validation (${vm}) ==="
+  if ! validate_linux_server_password_ssh "$ip" "$vm"; then
+    linux_server_emit_legacy_credential_warnings "$ip" "${RUN}/${vm}/cloud-init" "pre_snapshot_create"
+    echo "ERROR: password SSH validation failed before snapshot (ip=${ip})" >&2
+    return 1
+  fi
+  who="$(linux_server_password_ssh "$ip" 'whoami' 2>/dev/null | tr -d '\r' || true)"
+  if [[ "$who" != "$expected_user" ]]; then
+    linux_server_emit_legacy_credential_warnings "$ip" "${RUN}/${vm}/cloud-init" "pre_snapshot_create"
+    echo "ERROR: whoami mismatch before snapshot (expected=${expected_user} got=${who:-empty})" >&2
+    return 1
+  fi
+  if ! out="$(linux_server_password_ssh "$ip" 'sudo -n true && echo SUDO_OK' 2>/dev/null)" || [[ "$out" != "SUDO_OK" ]]; then
+    echo "ERROR: sudo -n validation failed before snapshot" >&2
+    return 1
+  fi
+  host_seen="$(linux_server_password_ssh "$ip" 'hostname -s' 2>/dev/null | tr -d '\r' || true)"
+  if [[ "$host_seen" != "$expected_host" ]]; then
+    echo "ERROR: hostname mismatch (expected=${expected_host} got=${host_seen:-empty})" >&2
+    return 1
+  fi
+  ip_seen="$(linux_server_password_ssh "$ip" "ip -4 -o addr show scope global | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null | tr -d '\r' || true)"
+  if ! grep -qx "${ip}" <<<"${ip_seen}"; then
+    echo "ERROR: IP mismatch (expected=${ip} got=${ip_seen:-empty})" >&2
+    return 1
+  fi
+  echo "INFO pre_snapshot_validate_ok vm=${vm} ip=${ip} hostname=${host_seen}"
+  log_structured "INFO" "linux_server_pre_snapshot_validate_ok vm=${vm} ip=${ip} hostname=${host_seen}"
+  return 0
+}
+
 validate_victim_linux_cloud_init_user_data_keys() {
   local user_data="$1" keys_file="$2"
   python3 - "$user_data" "$keys_file" <<'PY'
@@ -2464,6 +2895,7 @@ import pathlib, sys
 
 ud_path, keys_path = sys.argv[1], sys.argv[2]
 ud = pathlib.Path(ud_path).read_text(encoding="utf-8")
+ud_compact = ud.replace(" ", "")
 keys = [
     ln.strip()
     for ln in pathlib.Path(keys_path).read_text(encoding="utf-8").splitlines()
@@ -2474,15 +2906,76 @@ if not keys:
 missing = [k for k in keys if k not in ud]
 if missing:
     sys.exit(f"authorized_keys missing from user-data count={len(missing)}")
-if "ssh_pwauth: false" not in ud and "ssh_pwauth:false" not in ud.replace(" ", ""):
-    sys.exit("ssh_pwauth must be false")
-if "lock_passwd: true" not in ud and "lock_passwd:true" not in ud.replace(" ", ""):
-    sys.exit("lock_passwd must be true")
-if "name: lab" not in ud:
-    sys.exit("users block must define name: lab")
+if "plain_text_passwd" in ud:
+    sys.exit("plain_text_passwd must not be used (use chpasswd)")
+if "ssh_pwauth: true" not in ud and "ssh_pwauth:true" not in ud_compact:
+    sys.exit("ssh_pwauth must be true")
+if "chpasswd:" not in ud:
+    sys.exit("chpasswd block missing")
+if "labuser:" not in ud:
+    sys.exit("chpasswd must set labuser password")
+if "lock_passwd: false" not in ud and "lock_passwd:false" not in ud_compact:
+    sys.exit("labuser lock_passwd must be false")
+if "name: labuser" not in ud:
+    sys.exit("users block must define name: labuser")
+if "name: lab" in ud and "name: labuser" not in ud:
+    sys.exit("legacy user lab detected; use labuser")
 if "ssh_authorized_keys:" not in ud:
     sys.exit("ssh_authorized_keys block missing under users")
+import re
+if re.search(r"^packages:\s*$", ud, re.MULTILINE):
+    sys.exit("cloud-init must not install packages (bake qemu-guest-agent into base image)")
+if re.search(r"^runcmd:\s*$", ud, re.MULTILINE):
+    sys.exit("cloud-init must not use runcmd (minimal deterministic mode)")
+if re.search(r"^package_update:\s*true", ud, re.MULTILINE):
+    sys.exit("package_update must not be enabled")
+if re.search(r"^package_upgrade:\s*true", ud, re.MULTILINE):
+    sys.exit("package_upgrade must not be enabled")
+users_blocks = re.findall(r"^users:\s*$", ud, re.MULTILINE)
+if len(users_blocks) != 1:
+    sys.exit(f"malformed user-data: expected exactly one users: key, found {len(users_blocks)}")
+try:
+    import yaml  # type: ignore
+except ImportError:
+    yaml = None
+if yaml is not None:
+    docs = list(yaml.safe_load_all(ud))
+    if not docs or not isinstance(docs[0], dict):
+        sys.exit("user-data is not valid cloud-config YAML mapping")
+    if "users" not in docs[0]:
+        sys.exit("YAML missing users key")
 PY
+}
+
+validate_victim_linux_cloud_init_user_data_syntax() {
+  local user_data="$1"
+  python3 - "$user_data" <<'PY' || return 1
+import pathlib, re, sys
+
+ud = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+if not ud.lstrip().startswith("#cloud-config"):
+    sys.exit("missing #cloud-config header")
+users_blocks = re.findall(r"^users:\s*$", ud, re.MULTILINE)
+if len(users_blocks) != 1:
+    sys.exit(f"malformed user-data: expected exactly one users: key, found {len(users_blocks)}")
+try:
+    import yaml  # type: ignore
+except ImportError:
+    pass
+else:
+    doc = list(yaml.safe_load_all(ud))
+    if not doc or not isinstance(doc[0], dict):
+        sys.exit("user-data is not valid cloud-config YAML mapping")
+    if "users" not in doc[0]:
+        sys.exit("YAML missing users key")
+PY
+  if command -v cloud-init >/dev/null 2>&1; then
+    cloud-init schema --config-file "$user_data" >/dev/null 2>&1 || {
+      log_structured "WARN" "cloud_init_schema_validation_failed path=${user_data}"
+      return 1
+    }
+  fi
+  return 0
 }
 
 validate_victim_linux_pre_install_artifacts() {
@@ -2561,9 +3054,11 @@ EOF
 
 generate_user_data() {
   local out="$1" keys_file="$2" hostname="$3"
-  python3 - "$out" "$keys_file" "$hostname" <<'PY'
-import pathlib, sys
-outp, kpath, hostn = sys.argv[1], sys.argv[2], sys.argv[3]
+  VICTIM_LINUX_PASSWORD="${VICTIM_LINUX_PASSWORD:-lab1234}" \
+    python3 - "$out" "$keys_file" "$hostname" "${VICTIM_LINUX_PASSWORD}" <<'PY'
+import os, pathlib, sys
+outp, kpath, hostn, passwd = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+passwd = passwd or os.environ.get("VICTIM_LINUX_PASSWORD", "lab1234")
 keys = [
     ln.strip()
     for ln in pathlib.Path(kpath).read_text(encoding="utf-8").splitlines()
@@ -2581,31 +3076,24 @@ def _yaml_dq(s):
 lines = [
     "#cloud-config",
     f"hostname: {hostn}",
-    "fqdn: %s.lab.local" % hostn,
-    "manage_etc_hosts: true",
-    "package_update: false",
-    "package_upgrade: false",
-    "ssh_pwauth: false",
-    "lock_passwd: true",
+    "ssh_pwauth: true",
+    "disable_root: true",
     "users:",
-    "  - name: lab",
+    "  - name: labuser",
     "    sudo: ALL=(ALL) NOPASSWD:ALL",
     "    groups: sudo",
     "    shell: /bin/bash",
+    "    lock_passwd: false",
     "    ssh_authorized_keys:",
 ]
 for k in keys:
     lines.append("      - " + _yaml_dq(k))
 lines.extend(
     [
-        "packages:",
-        "  - openssh-server",
-        "  - qemu-guest-agent",
-        "runcmd:",
-        "  - [ systemctl, enable, qemu-guest-agent ]",
-        "  - [ systemctl, start, qemu-guest-agent ]",
-        "  - [ systemctl, enable, ssh ]",
-        "  - [ systemctl, start, ssh ]",
+        "chpasswd:",
+        "  list: |",
+        "    labuser:%s" % passwd,
+        "  expire: false",
     ]
 )
 pathlib.Path(outp).write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2630,19 +3118,37 @@ create_cloud_init_seed_iso() {
   rm -rf "${staging}"
 }
 
+linux_server_require_sshpass() {
+  if command -v sshpass >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "ERROR: sshpass is required for victim-linux password validation." >&2
+  echo "  Install: sudo apt-get install -y sshpass" >&2
+  echo "  Or run:  sudo ${XDR_ROOT}/installer/lab-host-victim-deps.sh" >&2
+  log_structured "ERROR" "linux_server_sshpass_missing"
+  return 1
+}
+
 linux_server_ssh_user_candidates() {
   local -a candidates=()
   local u
+  local expected="${VICTIM_CREDENTIAL_USER:-labuser}"
   if [[ -n "${VICTIM_LINUX_SSH_USER:-}" ]]; then
     candidates+=("${VICTIM_LINUX_SSH_USER}")
   fi
   for u in ${LINUX_SERVER_SSH_USER_CANDIDATES}; do
+    [[ "$u" == "lab" || "$u" == "ubuntu" ]] && continue
     local seen=0
     for c in "${candidates[@]}"; do
       [[ "$c" == "$u" ]] && seen=1 && break
     done
     [[ "$seen" -eq 0 ]] && candidates+=("$u")
   done
+  local seen_exp=0
+  for c in "${candidates[@]}"; do
+    [[ "$c" == "$expected" ]] && seen_exp=1 && break
+  done
+  [[ "$seen_exp" -eq 0 ]] && candidates=("$expected" "${candidates[@]}")
   printf '%s\n' "${candidates[@]}"
 }
 
@@ -2651,17 +3157,16 @@ linux_server_print_rendered_cloud_init() {
   echo ""
   echo "=== rendered cloud-init ==="
   echo ""
-  echo "users:"
-  sed -n '/^users:/,/^[^ ]/p' "$user_data" 2>/dev/null | sed '$d' || true
+  if validate_victim_linux_cloud_init_user_data_syntax "$user_data"; then
+    echo "user-data YAML: valid"
+  else
+    echo "WARNING: user-data YAML validation failed"
+  fi
   echo ""
-  echo "ssh_authorized_keys (lab user):"
-  awk '
-    /^[[:space:]]+- name: lab$/ { in_lab=1; next }
-    in_lab && /^[[:space:]]+ssh_authorized_keys:/ { in_keys=1; next }
-    in_lab && in_keys && /^[[:space:]]+- / { sub(/^[[:space:]]+- /, ""); print; next }
-    in_lab && in_keys && /^[^[:space:]]/ { exit }
-    in_lab && /^[[:space:]]+- name:/ && !/name: lab/ { exit }
-  ' "$user_data" 2>/dev/null || true
+  echo "user-data (password redacted):"
+  sed -e 's/^\([[:space:]]*labuser:\).*/\1***REDACTED***/' \
+      -e 's/ssh-ed25519 [^ ]*/ssh-ed25519 ***REDACTED***/' \
+      "$user_data" 2>/dev/null | sed 's/^/  /' || true
   echo ""
   echo "network config (addresses):"
   awk '/addresses:/{p=1} p{print} p && /^[^ ]/ && !/addresses:/{exit}' "$network_config" 2>/dev/null || true
@@ -2694,7 +3199,7 @@ linux_server_emit_post_deploy_artifacts() {
 
 linux_server_emit_deploy_failure_diagnostics() {
   local vm="$1" ip="$2" run_vm="$3" disk="$4" seed="$5" ci_dir="$6" reason="${7:-unknown}"
-  local dom_st domifaddr_out domiflist_out ping_rc ping_out
+  local dom_st domifaddr_out domiflist_out ping_rc qemu_info_out
 
   echo ""
   echo "=== ${vm} diagnostics (reason=${reason}) ==="
@@ -2721,10 +3226,44 @@ linux_server_emit_deploy_failure_diagnostics() {
   rm -f /tmp/xdr-victim-linux-ping.$$ 2>/dev/null || true
   echo "  ping_exit=${ping_rc}"
   echo ""
-  echo "cloud-init status hint (from guest console or after SSH):"
-  echo "  cloud-init status --long"
-  echo "  journalctl -u cloud-init -n 80"
+  echo "tcp/22 probe ${ip}:"
+  if linux_server_wait_tcp_port "$ip" 22 2; then
+    echo "  open"
+  else
+    echo "  closed or unreachable"
+  fi
   echo ""
+  if [[ -n "${LINUX_SERVER_SSH_PASSWORD_LAST_STDERR:-}" ]]; then
+    echo "last password SSH stderr:"
+    printf '%s\n' "${LINUX_SERVER_SSH_PASSWORD_LAST_STDERR}" | sed 's/^/  /'
+    echo ""
+  fi
+  if [[ -n "${LINUX_SERVER_SSH_AUTH_LAST_STDERR:-}" && "${LINUX_SERVER_SSH_AUTH_LAST_STDERR}" != "${LINUX_SERVER_SSH_PASSWORD_LAST_STDERR:-}" ]]; then
+    echo "last auth stderr:"
+    printf '%s\n' "${LINUX_SERVER_SSH_AUTH_LAST_STDERR}" | sed 's/^/  /'
+    echo ""
+  fi
+  if command -v virsh >/dev/null 2>&1 && vm_exists "$vm"; then
+    if linux_server_qemu_agent_ping "$vm"; then
+      echo "qemu-guest-agent: responding"
+      qemu_info_out="$(virsh qemu-agent-command "$vm" '{"execute":"guest-info"}' 2>&1 || true)"
+      printf '%s\n' "${qemu_info_out}" | sed 's/^/  /'
+      echo ""
+    else
+      echo "qemu-guest-agent: not responding"
+      echo ""
+      linux_server_collect_guest_cloud_init_logs "$vm" "$ip"
+    fi
+  fi
+  if command -v sshpass >/dev/null 2>&1 && [[ -n "$ip" ]] && linux_server_wait_tcp_port "$ip" 22 2; then
+    linux_server_run_cloud_init_diagnostics "$ip" "$vm" || true
+  else
+    echo "cloud-init remote diagnostics skipped (sshpass missing, no IP, or tcp/22 closed)"
+    echo "  cloud-init status --wait"
+    echo "  cloud-init status --long"
+    echo "  journalctl -u cloud-init --no-pager -n 100"
+    echo ""
+  fi
   echo "disk path:"
   echo "  ${disk}"
   echo ""
@@ -2734,12 +3273,19 @@ linux_server_emit_deploy_failure_diagnostics() {
   echo "cloud-init artifacts:"
   if [[ -d "$ci_dir" ]]; then
     find "$ci_dir" -maxdepth 1 -type f -printf '  %p\n' 2>/dev/null | sort || ls -la "$ci_dir" 2>/dev/null || true
+    if [[ -f "${ci_dir}/user-data" ]]; then
+      echo ""
+      echo "user-data (password redacted):"
+      sed -e 's/^\([[:space:]]*labuser:\).*/\1***REDACTED***/' -e 's/^\([[:space:]]*lab:\).*/\1***REDACTED***/' "${ci_dir}/user-data" 2>/dev/null | sed 's/^/  /' || true
+    fi
   else
     echo "  (preserved dir missing: ${ci_dir})"
   fi
   echo ""
   echo "try:"
   echo "  virsh console ${vm}"
+  echo "  sshpass -p '***' ssh -o StrictHostKeyChecking=no ${VICTIM_LINUX_SSH_PASSWORD_USER:-labuser}@${ip} 'cloud-init status --long'"
+  linux_server_emit_legacy_credential_warnings "$ip" "$ci_dir" "$reason" || true
   echo ""
   log_structured "WARN" "linux_server_deploy_failure_preserved vm=${vm} reason=${reason} run_vm=${run_vm}"
 }
@@ -2777,37 +3323,33 @@ validate_vm_boot() {
   return 1
 }
 
-validate_ssh_connectivity() {
+validate_victim_linux_ssh_connectivity() {
   local ip="$1"
-  shift
-  local -a users=() ssh_cmd=()
-  local user deadline identity last_cmd_summary=""
+  local expected="${VICTIM_CREDENTIAL_USER:-labuser}"
+  local -a users=()
+  local user deadline identity last_cmd_summary="" who_out
   local per_attempt_timeout=7
 
-  if [[ $# -gt 0 ]]; then
-    users=("$@")
-  else
-    while IFS= read -r user; do
-      [[ -n "$user" ]] && users+=("$user")
-    done < <(linux_server_ssh_user_candidates)
-  fi
-  [[ ${#users[@]} -gt 0 ]] || users=(ubuntu lab)
+  while IFS= read -r user; do
+    [[ -n "$user" ]] && users+=("$user")
+  done < <(linux_server_ssh_user_candidates)
+  [[ ${#users[@]} -gt 0 ]] || users=("$expected")
 
   identity="$(linux_server_discover_ssh_identity)" || {
-    log_structured "ERROR" "validate_ssh_connectivity_no_identity"
+    log_structured "ERROR" "validate_victim_linux_ssh_connectivity_no_identity"
     echo "ERROR ssh_validation_failed reason=no_ssh_identity" >&2
     return 1
   }
 
   deadline=$((SECONDS + XDR_LAB_SSH_VALIDATION_TIMEOUT))
-  log_structured "INFO" "validate_ssh_connectivity_begin ip=${ip} users=${users[*]} identity=${identity} timeout=${XDR_LAB_SSH_VALIDATION_TIMEOUT}"
+  log_structured "INFO" "validate_victim_linux_ssh_connectivity_begin ip=${ip} users=${users[*]} identity=${identity} expected_whoami=${expected}"
   LINUX_SERVER_SSH_VALIDATED_USER=""
 
   while (( SECONDS < deadline )); do
     for user in "${users[@]}"; do
-      ssh_cmd=(
-        ssh
-        -i "$identity"
+      [[ "$user" == "$expected" ]] || continue
+      local -a ssh_cmd=(
+        ssh -i "$identity"
         -o IdentitiesOnly=yes
         -o BatchMode=yes
         -o ConnectTimeout=5
@@ -2816,31 +3358,36 @@ validate_ssh_connectivity() {
       if [[ -n "${XDR_LAB_SSH_USER_KNOWN_HOSTS_FILE:-}" ]]; then
         ssh_cmd+=(-o "UserKnownHostsFile=${XDR_LAB_SSH_USER_KNOWN_HOSTS_FILE}")
       fi
-      ssh_cmd+=("${user}@${ip}" "hostname")
+      ssh_cmd+=("${user}@${ip}" "whoami")
+      last_cmd_summary="${user}@${ip} whoami"
 
-      last_cmd_summary="ssh -i ${identity} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no"
-      if [[ -n "${XDR_LAB_SSH_USER_KNOWN_HOSTS_FILE:-}" ]]; then
-        last_cmd_summary+=" -o UserKnownHostsFile=${XDR_LAB_SSH_USER_KNOWN_HOSTS_FILE}"
-      fi
-      last_cmd_summary+=" ${user}@${ip} hostname"
-
-      if timeout "$per_attempt_timeout" "${ssh_cmd[@]}" >/dev/null 2>&1; then
+      who_out="$(timeout "$per_attempt_timeout" "${ssh_cmd[@]}" 2>/dev/null | tr -d '\r' || true)"
+      if [[ "$who_out" == "$expected" ]]; then
         LINUX_SERVER_SSH_VALIDATED_USER="$user"
-        log_structured "INFO" "validate_ssh_connectivity_ok ip=${ip} user=${user} identity=${identity}"
+        log_structured "INFO" "validate_victim_linux_ssh_connectivity_ok ip=${ip} user=${user} whoami=${who_out}"
         echo "INFO ssh_validation_success user=${user}"
         return 0
+      fi
+      if [[ "$who_out" == "lab" ]]; then
+        log_structured "WARN" "validate_victim_linux_ssh_connectivity_legacy_user ip=${ip} whoami=lab"
+        linux_server_emit_legacy_credential_warnings "$ip" "${RUN}/victim-linux/cloud-init" "key_ssh_legacy_lab"
       fi
     done
     sleep 3
   done
 
-  log_structured "ERROR" "validate_ssh_connectivity_failed ip=${ip} users=${users[*]} identity=${identity} cmd=${last_cmd_summary}"
-  echo "ERROR ssh_validation_failed cmd_summary=\"${last_cmd_summary}\"" >&2
+  log_structured "ERROR" "validate_victim_linux_ssh_connectivity_failed ip=${ip} users=${users[*]} expected=${expected}"
+  echo "ERROR ssh_validation_failed expected_whoami=${expected} cmd_summary=\"${last_cmd_summary}\"" >&2
   return 1
 }
 
+# Generic key-based SSH probe (non-victim VMs only). Victim-linux must use validate_victim_linux_ssh_connectivity.
+validate_ssh_connectivity() {
+  validate_victim_linux_ssh_connectivity "$@"
+}
+
 validate_reboot_persistence() {
-  local vm="$1" ip="$2" user="$3"
+  local vm="$1" ip="$2" user="${3:-}"
   if [[ "${XDR_LAB_SKIP_REBOOT_TEST:-}" == "1" ]]; then
     log_structured "INFO" "validate_reboot_persistence_skip vm=${vm} reason=env_XDR_LAB_SKIP_REBOOT_TEST"
     return 0
@@ -2852,17 +3399,22 @@ validate_reboot_persistence() {
     log_structured "ERROR" "validate_reboot_persistence_failed vm=${vm} step=boot_after_reboot"
     return 1
   fi
-  if ! validate_ssh_connectivity "$ip"; then
-    log_structured "ERROR" "validate_reboot_persistence_failed vm=${vm} step=ssh_after_reboot"
+  if ! validate_linux_server_password_ssh "$ip" "$vm"; then
+    log_structured "ERROR" "validate_reboot_persistence_failed vm=${vm} step=password_ssh_after_reboot"
     return 1
   fi
-  log_structured "INFO" "validate_reboot_persistence_ok vm=${vm}"
+  if ! validate_victim_linux_ssh_connectivity "$ip"; then
+    log_structured "WARN" "validate_reboot_persistence_key_ssh_failed vm=${vm} (password SSH ok)"
+  fi
+  log_structured "INFO" "validate_reboot_persistence_ok vm=${vm} user=${LINUX_SERVER_SSH_VALIDATED_USER:-labuser}"
   return 0
 }
 
 deploy_linux_server_cloud() {
   local vm="$1"
   local nodownload="${2:-0}"
+
+  linux_server_require_sshpass || die "sshpass required for victim-linux deploy validation (see installer/lab-host-victim-deps.sh)"
 
   require_cmd qemu-img
   require_cmd virt-install
@@ -2922,21 +3474,32 @@ deploy_linux_server_cloud() {
   log_structured "INFO" "deploy_victim_linux_banner base_image=${base} ssh_key=${ssh_key_src} libvirt_network=${LAB_OVS_NETWORK} static_ip=${static_ip} cloud_init=enabled"
 
   if vm_exists "$vm"; then
-    log_structured "INFO" "deploy_linux_server_idempotent_domain_exists vm=${vm}"
-    virsh start "$vm" >/dev/null 2>&1 || true
-    apply_autostart "$vm"
-    if ! validate_vm_boot "$vm"; then
-      die "Existing domain ${vm} is not running; destroy and redeploy"
+    if [[ "${XDR_LAB_VICTIM_LINUX_FORCE_REDEPLOY:-0}" == "1" ]]; then
+      log_structured "WARN" "deploy_linux_server_force_redeploy vm=${vm}"
+      linux_server_redeploy_cleanup "$vm" "$run_vm" "$disk" "$seed"
+    else
+      log_structured "INFO" "deploy_linux_server_idempotent_domain_exists vm=${vm}"
+      virsh start "$vm" >/dev/null 2>&1 || true
+      apply_autostart "$vm"
+      if ! validate_vm_boot "$vm"; then
+        die "Existing domain ${vm} is not running; set XDR_LAB_VICTIM_LINUX_FORCE_REDEPLOY=1 or destroy and redeploy"
+      fi
+      if ! validate_linux_server_deploy_ready "$static_ip" "$vm"; then
+        linux_server_handle_deploy_failure "$vm" "$run_vm" "$disk" "$seed" "$ci_dir" "idempotent_password_ssh_failed" "$static_ip"
+        die "Existing domain ${vm} failed deploy readiness validation (VM and artifacts preserved for debugging)"
+      fi
+      linux_server_run_cloud_init_diagnostics "$static_ip" "$vm" || true
+      validate_victim_linux_ssh_connectivity "$static_ip" || log_structured "WARN" "deploy_linux_server_idempotent_key_ssh_failed vm=${vm}"
+      log_structured "INFO" "deploy_linux_server_idempotent_ok vm=${vm}"
+      validate_vm_libvirt_network_attach "$vm" || true
+      linux_server_emit_post_deploy_artifacts "$vm" "$run_vm" "$disk" "$seed" "$ci_dir"
+      _invoke_state_refresh "$vm" 0
+      return 0
     fi
-    if ! validate_ssh_connectivity "$static_ip"; then
-      linux_server_handle_deploy_failure "$vm" "$run_vm" "$disk" "$seed" "$ci_dir" "idempotent_ssh_validation_failed" "$static_ip"
-      die "Existing domain ${vm} failed SSH validation (VM and artifacts preserved for debugging)"
-    fi
-    log_structured "INFO" "deploy_linux_server_idempotent_ok vm=${vm}"
-    validate_vm_libvirt_network_attach "$vm" || true
-    linux_server_emit_post_deploy_artifacts "$vm" "$run_vm" "$disk" "$seed" "$ci_dir"
-    _invoke_state_refresh "$vm" 0
-    return 0
+  fi
+
+  if [[ -f "$disk" || -f "$seed" ]]; then
+    linux_server_redeploy_cleanup "$vm" "$run_vm" "$disk" "$seed"
   fi
 
   mkdir -p "$ci_dir" "$run_vm"
@@ -2951,19 +3514,17 @@ deploy_linux_server_cloud() {
   }
 
   generate_user_data "$ud" "$keys" "$hostn"
+  validate_victim_linux_cloud_init_user_data_syntax "$ud" || \
+    die "victim-linux user-data YAML validation failed (see ${ud})"
   generate_network_config "$nc" "$ip_cidr" "$gw" "$dns"
+  local deploy_iid="${vm}-$(date -u +%Y%m%dT%H%M%SZ)"
   cat >"$md" <<EOF
-instance-id: ${vm}
+instance-id: ${deploy_iid}
 local-hostname: ${hostn}
 dsmode: local
 EOF
 
   linux_server_print_rendered_cloud_init "$ud" "$nc"
-
-  if [[ -f "$disk" || -f "$seed" ]]; then
-    log_structured "WARN" "deploy_linux_server_cleanup_stale_artifacts vm=${vm}"
-    rm -f "$disk" "$seed" 2>/dev/null || true
-  fi
 
   log_structured "INFO" "deploy_linux_server_qemu_img_create vm=${vm} backing=${base}"
   qemu-img create -f qcow2 -F qcow2 -b "$base" "$disk" "${disk_gb}G"
@@ -2988,6 +3549,7 @@ EOF
     --vcpus "$cpu" \
     --disk "path=${disk},format=qcow2,bus=virtio" \
     --disk "path=${seed},device=cdrom,bus=sata" \
+    --channel unix,target_type=virtio,name=org.qemu.guest_agent.0 \
     --import \
     --os-variant ubuntu24.04 \
     --virt-type kvm \
@@ -3010,9 +3572,14 @@ EOF
     linux_server_handle_deploy_failure "$vm" "$run_vm" "$disk" "$seed" "$ci_dir" "boot_validation_failed" "$static_ip"
     die "Boot validation failed for ${vm} (VM and artifacts preserved)"
   fi
-  if ! validate_ssh_connectivity "$static_ip"; then
-    linux_server_handle_deploy_failure "$vm" "$run_vm" "$disk" "$seed" "$ci_dir" "ssh_validation_failed" "$static_ip"
-    die "SSH validation failed for ${vm} (ip=${static_ip}) — VM, disk, seed, and cloud-init artifacts preserved"
+  if ! validate_linux_server_deploy_ready "$static_ip" "$vm"; then
+    linux_server_handle_deploy_failure "$vm" "$run_vm" "$disk" "$seed" "$ci_dir" "deploy_readiness_failed" "$static_ip"
+    die "Deploy readiness failed for ${vm} (ip=${static_ip}) — requires ping/tcp22/password SSH (labuser)"
+  fi
+  echo "INFO password_ssh_validation_success user=${LINUX_SERVER_SSH_VALIDATED_USER:-labuser} whoami=${VICTIM_CREDENTIAL_USER:-labuser}"
+  linux_server_run_cloud_init_diagnostics "$static_ip" "$vm" || true
+  if ! validate_victim_linux_ssh_connectivity "$static_ip"; then
+    log_structured "WARN" "deploy_linux_server_key_ssh_validation_failed vm=${vm} ip=${static_ip} (password SSH ok)"
   fi
   validate_reboot_persistence "$vm" "$static_ip" "${LINUX_SERVER_SSH_VALIDATED_USER:-lab}" || {
     linux_server_handle_deploy_failure "$vm" "$run_vm" "$disk" "$seed" "$ci_dir" "reboot_persistence_failed" "$static_ip"
@@ -3217,8 +3784,14 @@ destroy_vm() {
   fi
   log_structured "INFO" "destroy_vm vm=${vm}"
   virsh destroy "$vm" >/dev/null 2>&1 || true
-  virsh undefine "$vm" --managed-save --snapshots-metadata >/dev/null 2>&1 || \
-    virsh undefine "$vm" >/dev/null 2>&1 || true
+  if [[ "$vm" == "victim-linux" ]]; then
+    virsh undefine "$vm" --nvram >/dev/null 2>&1 || \
+      virsh undefine "$vm" --managed-save --snapshots-metadata >/dev/null 2>&1 || \
+      virsh undefine "$vm" >/dev/null 2>&1 || true
+  else
+    virsh undefine "$vm" --managed-save --snapshots-metadata >/dev/null 2>&1 || \
+      virsh undefine "$vm" >/dev/null 2>&1 || true
+  fi
   rm -f "${RUN}/${vm}-runtime.qcow2" || true
   rm -rf "${RUN}/${vm}" 2>/dev/null || true
   _invoke_state_refresh "$vm" 0
@@ -3293,6 +3866,12 @@ print("  VM               internal_ip    service   external→internal (TCP)")
 print("  sensor-vm        10.10.10.10    ssh       1022 → 22")
 print("  victim-linux     10.10.10.20    ssh       2022 → 22")
 print("  windows-victim   10.10.10.30    rdp       3389 → 3389")
+print("")
+print("Victim credentials (attack targets; standardized):")
+print("  victim-linux:     labuser / lab1234  (SSH password + keys)")
+print("  windows-victim:   labuser / lab1234  (RDP / OpenSSH when enabled)")
+print("Sensor credential policy:")
+print("  sensor-vm:        vendor-managed / intentionally not normalized by XDR Lab")
 print("")
 print("Optional management (websockify → 127.0.0.1 QEMU VNC; not iptables DNAT):")
 if wc_map:
@@ -3647,6 +4226,15 @@ snapshot_create_vms() {
     fi
     policy="$(snapshot_vm_policy "$vm")"
     errf="$(mktemp)"
+    if [[ "$vm" == "victim-linux" ]]; then
+      if ! linux_server_pre_snapshot_validate "$vm" "${VICTIM_LINUX_MATERIALIZED_IP}" "$vm"; then
+        log_structured "ERROR" "snapshot_create_blocked vm=${vm} name=${nm} reason=pre_snapshot_credential_validation_failed"
+        _snapshot_result_line "$vm" "0" "pre_snapshot_credential_validation_failed" "$linesf"
+        overall=1
+        rm -f "${errf}"
+        continue
+      fi
+    fi
     if snapshot_create_vm "$vm" "$nm" "$errf"; then
       log_structured "INFO" "snapshot_create_ok vm=${vm} name=${nm} mode=${policy}"
       rm -f "${errf}"
@@ -3714,6 +4302,24 @@ snapshot_revert_vms() {
     policy="$(snapshot_vm_policy "$vm")"
     errf="$(mktemp)"
     if snapshot_revert_vm "$vm" "$nm" "$errf"; then
+      if [[ "$vm" == "victim-linux" ]]; then
+        sleep 5
+        if command -v sshpass >/dev/null 2>&1; then
+          local legacy_who
+          legacy_who="$(linux_server_password_ssh "${VICTIM_LINUX_MATERIALIZED_IP}" 'whoami' "lab" 2>/dev/null | tr -d '\r' || true)"
+          if [[ "$legacy_who" == "lab" ]]; then
+            echo "WARNING: snapshot revert restored legacy account 'lab' on ${VICTIM_LINUX_MATERIALIZED_IP}; redeploy and recreate snapshot." >&2
+          fi
+        fi
+        if ! validate_linux_server_deploy_ready "${VICTIM_LINUX_MATERIALIZED_IP}" "victim-linux"; then
+          linux_server_emit_legacy_credential_warnings "${VICTIM_LINUX_MATERIALIZED_IP}" "${RUN}/${vm}/cloud-init" "post_snapshot_revert"
+          log_structured "ERROR" "snapshot_revert_post_validate_failed vm=${vm} name=${nm} ip=${VICTIM_LINUX_MATERIALIZED_IP}"
+          _snapshot_result_line "$vm" "0" "post_revert_password_ssh_failed" "$linesf"
+          overall=1
+          rm -f "${errf}"
+          continue
+        fi
+      fi
       log_structured "INFO" "snapshot_revert_ok vm=${vm} name=${nm} policy=${policy}"
       rm -f "${errf}"
       continue
@@ -4122,7 +4728,9 @@ Notes:
   victim-linux: set XDR_LAB_SKIP_REBOOT_TEST=1 to skip post-deploy reboot validation.
   victim-linux: deploy failures preserve VM, disk, seed.iso, and ${XDR_RUNTIME_DIR}/victim-linux/cloud-init/ (no auto rollback).
   windows-victim: deploy failures preserve VM, disk, and ${XDR_RUNTIME_DIR}/windows-victim/nvram/ (no auto rollback).
-  victim-linux: SSH validation tries users in order: ubuntu, lab (override LINUX_SERVER_SSH_USER_CANDIDATES).
+  victim-linux: minimal cloud-init (no packages:/runcmd); qemu-guest-agent baked into base image via virt-customize.
+  victim-linux: deploy success requires ping/tcp22/password SSH (labuser/lab1234 via sshpass); guest-agent is warning-only.
+  victim-linux: set XDR_LAB_VICTIM_LINUX_FORCE_REDEPLOY=1 to destroy and recreate domain + disks on deploy.
   victim-linux: SSH validation uses explicit identity (-i), IdentitiesOnly=yes, BatchMode=yes, ConnectTimeout=5 (override XDR_LAB_VICTIM_LINUX_SSH_IDENTITY, XDR_LAB_SSH_VALIDATION_TIMEOUT, XDR_LAB_SSH_USER_KNOWN_HOSTS_FILE).
   victim-linux: SSH keys auto-discovered (priority): XDR_LAB_VICTIM_LINUX_AUTHORIZED_KEYS, ${XDR_ROOT}/config/victim-linux-authorized_keys, operator ~/.ssh/id_ed25519.pub, id_rsa.pub, first ~/.ssh/*.pub (sudo uses SUDO_USER home)
   Runtime state JSON: one file per VM under XDR_RUNTIME_STATE_DIR (see config/paths.sh).

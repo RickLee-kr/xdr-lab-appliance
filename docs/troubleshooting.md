@@ -6,6 +6,21 @@ CALDERA matrices. For adversary-run failures see also
 
 ---
 
+## Victim login / credential drift (`victim-linux`, `windows-victim`)
+
+| Field | Content |
+| --- | --- |
+| **Symptoms** | Console or SSH rejects `labuser` / `lab1234`; works with old user `lab`; snapshot revert breaks login |
+| **Expected** | **labuser** / **lab1234** on victim VMs (see `docs/access.md`) |
+| **Likely causes** | Ubuntu 24.04 `plain_text_passwd` in old seed ISO; baseline snapshot taken before password was set; stale `root.qcow2` / seed not removed on redeploy; cloud-init not finished |
+| **Validation** | `sshpass -p lab1234 ssh -o StrictHostKeyChecking=no labuser@10.10.10.20 whoami` → `labuser`; `cloud-init status --long` on guest |
+| **Recovery** | `XDR_LAB_VICTIM_LINUX_FORCE_REDEPLOY=1` + `aella_cli lab deploy victim-linux`; recreate snapshot after deploy verification; see `docs/linux-cloudinit.md` |
+| **Legacy warning** | Deploy/snapshot paths print warnings if user `lab` still works or `user-data` contains `plain_text_passwd` |
+
+`sensor-vm` credentials are **intentionally not** changed for victim consistency.
+
+---
+
 ## `br0_down` — lab gateway unreachable
 
 | Field | Content |

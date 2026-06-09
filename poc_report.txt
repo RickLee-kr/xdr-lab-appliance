@@ -1,0 +1,48 @@
+PRE_WEBSHELL_URL_SCAN_SUMMARY
+target=http://10.10.10.20:8080/
+base_url=http://10.10.10.20:8080/
+total_requests=43
+unique_urls=43
+http_200=43
+http_301=0
+http_302=0
+http_400=0
+http_401=0
+http_403=0
+http_404=0
+http_405=0
+http_500=0
+timeout=0
+real_failed=0
+redirect_count=0
+ua_present=43
+abnormal_ua=43
+duration_seconds=3
+detection_likelihood=low
+reason=below medium threshold (unique=43 real_failed=0 abnormal_ua=43 duration=3s)
+DETECTION_QUALITY
+
+stage=Pre-WebShell URL Scan
+events_generated=43
+duration=3
+targets=http://10.10.10.20:8080/
+classification=external_url_recon
+quality=low
+
+reason=below medium threshold (unique=43 real_failed=0 abnormal_ua=43 duration=3s)
+EXECUTIVE_SUMMARY
+
+Hosts Discovered: 0
+Open Services: 0
+HTTP Targets: 0
+SSH Targets: 0
+DNS Targets: 0
+
+Traffic Generated:
+
+Port Scan: 0 services mapped
+HTTP Recon: 0 requests (0 responses)
+HTTP URL Scan: 0 unique URLs (0 failed)
+SSH Authentication Attempts: 0
+DNS Tunnel: 0 queries
+Overall Assessment:  — HTTP URL Scan score=0 Beacon=0 DGA=0 DNS=0

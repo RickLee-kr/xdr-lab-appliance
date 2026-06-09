@@ -3,7 +3,7 @@ hostname: test-vm2
 manage_etc_hosts: true
 
 users:
-  - name: lab
+  - name: labuser
     # Template-only default: replace with an operator key before use.
     sudo: ALL=(ALL) ALL
     shell: /bin/bash

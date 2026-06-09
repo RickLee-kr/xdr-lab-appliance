@@ -174,6 +174,15 @@ for the three core VMs so `access` and `nat verify` stay aligned.
 | `victim-linux` | `10.10.10.20` | SSH | TCP **2022** → 22 |
 | `windows-victim` | `10.10.10.30` | RDP | TCP **3389** → 3389 |
 
+**Victim credentials** (attack targets — one operator mnemonic):
+
+| VM | Username | Password | Notes |
+| --- | --- | --- | --- |
+| `victim-linux` | `labuser` | `lab1234` | cloud-init `chpasswd`; SSH password + operator keys |
+| `windows-victim` | `labuser` | `lab1234` | baked into golden qcow2 / sysprep |
+
+`sensor-vm` credentials are **vendor-managed** and intentionally **not** normalized by this appliance (observer-only stability).
+
 **Optional management** (not iptables DNAT — websockify on the host only):
 
 | VM | websockify (host) | QEMU VNC (localhost) | URL (on appliance) |
@@ -188,9 +197,9 @@ Typical CLI (replace `<EXT>` with the appliance’s external IPv4 from
 `access` output):
 
 ```bash
-ssh -p 1022 sensor@<EXT>
-ssh -p 2022 ubuntu@<EXT>
-# RDP client → <EXT>:3389
+ssh -p 1022 sensor@<EXT>          # sensor-vm: vendor credential (unchanged by XDR Lab)
+ssh -p 2022 labuser@<EXT>         # victim-linux: password lab1234
+# RDP client → <EXT>:3389         # windows-victim: labuser / lab1234
 # Browser (optional) → http://127.0.0.1:6082/   (after: lab web-console start windows-victim)
 ```
 
@@ -236,8 +245,10 @@ See `docs/specs/007-ovs-mirror-policy/spec.md` for the policy and
    `network-config` (static IP, gateway, DNS).
 3. `qemu-img create -b <base>` builds a thin overlay; `virt-install
    --import` boots it.
-4. The VM manager validates SSH connectivity and reboot persistence
-   before declaring the deploy successful.
+4. The VM manager bakes **qemu-guest-agent** into the cached Ubuntu base image
+   (`virt-customize`), uses **minimal cloud-init** (no `packages:` / `runcmd`), and
+   validates **password SSH** (`labuser` / `lab1234`) before declaring deploy
+   successful. Guest-agent connectivity is best-effort only. See `docs/linux-cloudinit.md`.
 
 Templates live in `cloud-init/<vm-name>/` and the manual one-shot
 helper is `scripts/create-cloud-vm.sh`.

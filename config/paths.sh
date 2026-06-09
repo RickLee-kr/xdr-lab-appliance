@@ -96,7 +96,7 @@ BACKUPS_DIR="${PROJECT_ROOT}/backups"
 # 1 = delete and recreate NVRAM from template on each deploy; 0 = reuse if present.
 : "${XDR_LAB_WINDOWS_RECREATE_NVRAM:=0}"
 # If non-empty, state refresh probes SSH (OpenSSH) as this user on the guest.
-: "${XDR_LAB_WINDOWS_SSH_USER:=lab}"
+: "${XDR_LAB_WINDOWS_SSH_USER:=labuser}"
 
 # --- Windows emergency VNC (localhost QEMU + host socat TCP forward) -----
 # Default external listen port avoids collision with typical :0 -> 5900 on 127.0.0.1.

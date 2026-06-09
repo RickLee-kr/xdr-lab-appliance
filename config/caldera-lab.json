@@ -83,7 +83,7 @@
     "victim-linux": {
       "enabled": true,
       "bootstrap": "linux",
-      "ssh_user": ""
+      "ssh_user": "labuser"
     },
     "windows-victim": {
       "enabled": true,

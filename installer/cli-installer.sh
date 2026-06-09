@@ -137,6 +137,18 @@ verify_installed_mirror_asset() {
 
 verify_installed_mirror_asset "${SRC_SCRIPTS}/ovs_mirror_state.py" "${XDR_ROOT}/scripts/ovs_mirror_state.py"
 verify_installed_mirror_asset "${SRC_SCRIPTS}/xdr-lab-vm-manager.sh" "${XDR_ROOT}/scripts/xdr-lab-vm-manager.sh"
+
+if grep -qE 'ubuntu lab|users=\(ubuntu lab\)|LINUX_SERVER_SSH_USER_CANDIDATES="\$\{LINUX_SERVER_SSH_USER_CANDIDATES:-ubuntu lab\}"' \
+  "${XDR_ROOT}/scripts/xdr-lab-vm-manager.sh" 2>/dev/null; then
+  echo "ERROR: installed xdr-lab-vm-manager.sh still contains legacy victim credential patterns (ubuntu/lab)." >&2
+  exit 1
+fi
+
+install -m 0755 "${PROJECT_ROOT}/installer/lab-host-victim-deps.sh" "${XDR_ROOT}/installer/lab-host-victim-deps.sh"
+if command -v apt-get >/dev/null 2>&1; then
+  echo "Installing victim-linux host dependency: sshpass ..."
+  bash "${XDR_ROOT}/installer/lab-host-victim-deps.sh" || echo "WARN: sshpass install failed; run sudo ${XDR_ROOT}/installer/lab-host-victim-deps.sh manually" >&2
+fi
 verify_installed_mirror_asset "${SRC_SCRIPTS}/caldera_orchestration.py" "${XDR_ROOT}/scripts/caldera_orchestration.py"
 verify_installed_mirror_asset "${SRC_BOOTSTRAP}/_runtime-validation-lib.sh" "${XDR_ROOT}/bootstrap/_runtime-validation-lib.sh"
 verify_installed_mirror_asset "${SRC_BOOTSTRAP}/validate-ovs-mirror.sh" "${XDR_ROOT}/bootstrap/validate-ovs-mirror.sh"

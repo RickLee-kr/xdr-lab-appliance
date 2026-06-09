@@ -25,20 +25,26 @@ mkdir -p "$WORKDIR"
 
 sudo qemu-img create -f qcow2 -F qcow2 -b "$BASE_IMG" "$VM_DISK" 20G
 
+: "${VICTIM_LINUX_PASSWORD:=lab1234}"
+
 cat > "$WORKDIR/user-data" <<EOF2
 #cloud-config
 hostname: ${VM_NAME}
 manage_etc_hosts: true
 
 users:
-  - name: lab
+  - name: labuser
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     lock_passwd: false
-    plain_text_passwd: lab1234
+
+chpasswd:
+  list: |
+    labuser:${VICTIM_LINUX_PASSWORD}
+  expire: false
 
 ssh_pwauth: true
-disable_root: false
+disable_root: true
 
 write_files:
   - path: /etc/netplan/50-cloud-init.yaml
@@ -56,8 +62,9 @@ runcmd:
   - systemctl enable --now ssh
 EOF2
 
+DEPLOY_IID="${VM_NAME}-$(date -u +%Y%m%dT%H%M%SZ)"
 cat > "$WORKDIR/meta-data" <<EOF2
-instance-id: ${VM_NAME}
+instance-id: ${DEPLOY_IID}
 local-hostname: ${VM_NAME}
 EOF2
 

@@ -89,7 +89,7 @@
       "autostart": true,
       "os_variant": "win2k22",
       "disk_filename": "windows-victim.qcow2",
-      "ssh_user": "lab"
+      "ssh_user": "labuser"
     },
     "victim-linux": {
       "name": "victim-linux",
@@ -109,7 +109,8 @@
       },
       "autostart": true,
       "os_variant": "ubuntu22.04",
-      "disk_filename": "victim-linux.qcow2"
+      "disk_filename": "victim-linux.qcow2",
+      "ssh_user": "labuser"
     },
     "test-vm1": {
       "name": "test-vm1",

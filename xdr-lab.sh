@@ -230,8 +230,9 @@ run_show_access_info() {
   echo "Sensor SSH:"
   echo "  ssh -p 1022 lab@${host_ip}"
   echo
-  echo "Linux SSH:"
-  echo "  ssh -p 2022 lab@${host_ip}"
+  echo "Linux SSH (victim-linux):"
+  echo "  ssh -p 2022 labuser@${host_ip}"
+  echo "  password: lab1234"
   echo
   echo "Windows RDP:"
   echo "  ${host_ip}:3389"

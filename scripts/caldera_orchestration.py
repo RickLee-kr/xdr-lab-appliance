@@ -3857,7 +3857,7 @@ def resolve_linux_ssh_user(vm: str, cfg: dict[str, Any], lab: dict[str, Any]) ->
     if override:
         return override
     if vm == "victim-linux":
-        return os.environ.get("VICTIM_LINUX_SSH_USER", "lab").strip() or "lab"
+        return os.environ.get("VICTIM_LINUX_SSH_USER", "labuser").strip() or "labuser"
     entry = lab_vm_entry(lab, vm)
     vtype = str(entry.get("type") or "")
     if pick_ssh_user is not None:
