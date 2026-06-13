@@ -80,6 +80,8 @@ def build_traffic_summary(
         if not skipped:
             skipped = _last_evidence(events, sid, "http_followup_skipped")
         if not skipped:
+            skipped = _last_evidence(events, sid, "sql_injection_skipped")
+        if not skipped:
             skipped = _last_evidence(events, sid, "ssh_failure_skipped")
 
         scenario_summary: dict[str, Any] = {
@@ -110,10 +112,15 @@ def build_traffic_summary(
                 "ports_used": completed.get("ports_used", []),
                 "schemes_used": completed.get("schemes_used", []),
                 "scheme_by_port": completed.get("scheme_by_port", {}),
-                "https_fallback": completed.get("https_fallback", started.get("https_fallback", False)),
+                "https_fallback": False,
+                "https_targets_skipped": completed.get("https_targets_skipped")
+                or started.get("https_targets_skipped")
+                or skipped.get("https_targets_skipped", []),
                 "http_targets": completed.get("http_targets") or started.get("http_targets", []),
                 "https_targets": completed.get("https_targets") or started.get("https_targets", []),
                 "skipped_no_http_service": skipped.get("skipped_no_http_service", False),
+                "http_targets_not_found": skipped.get("http_targets_not_found", False)
+                or skipped.get("reason") == "HTTP_TARGETS_NOT_FOUND",
                 "duration_sec": completed.get("duration_sec"),
                 "response_code_distribution": completed.get("response_code_distribution", {}),
                 "selected_http_target_reason": completed.get("selected_http_target_reason")
@@ -166,6 +173,13 @@ def build_traffic_summary(
                 "payload_count": completed.get("payload_count", 0),
                 "payload_category_distribution": completed.get("payload_category_distribution", {}),
                 "transport_distribution": completed.get("transport_distribution", {}),
+                "ports_used": completed.get("ports_used", started.get("ports_used", [])),
+                "schemes_used": completed.get("schemes_used", started.get("schemes_used", [])),
+                "https_targets_skipped": completed.get("https_targets_skipped")
+                or started.get("https_targets_skipped")
+                or skipped.get("https_targets_skipped", []),
+                "http_targets_not_found": skipped.get("http_targets_not_found", False)
+                or skipped.get("reason") == "HTTP_TARGETS_NOT_FOUND",
                 "duration_sec": completed.get("duration_sec"),
                 "sql_injection_requests_jsonl": completed.get("sql_injection_requests_jsonl", ""),
             })

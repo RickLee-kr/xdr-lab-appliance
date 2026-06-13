@@ -139,14 +139,14 @@ def rank_probe_candidates(
 
 
 def _port_priority_bonus(port: int) -> int:
-    """Bash fast_safe_http_port_priority_score — prefer non-80 when errors available."""
+    """HTTP detection ports only — prefer non-80 when errors available."""
     return {
         8080: 700,
-        8443: 650,
+        8008: 680,
         8000: 600,
+        8888: 580,
         9000: 550,
         80: 200,
-        443: 150,
     }.get(port, 100)
 
 

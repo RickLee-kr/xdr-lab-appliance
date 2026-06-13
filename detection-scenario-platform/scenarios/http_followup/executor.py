@@ -96,6 +96,16 @@ def _write_request_log(ctx: RunContext, records: list[dict[str, Any]]) -> Path |
     return out_path
 
 
+def _write_wire_evidence_log(ctx: RunContext, records: list[dict[str, Any]]) -> Path | None:
+    run_dir = _run_dir_from_store(ctx)
+    if run_dir is None:
+        return None
+    from dsp.protocols.http.wire_evidence import write_wire_evidence_jsonl
+
+    out_path = run_dir / "http_wire_evidence.jsonl"
+    return write_wire_evidence_jsonl(out_path, records)
+
+
 def _errors_per_target(request_log: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for record in request_log:
@@ -119,7 +129,15 @@ def _redirect_only_warning(dist: dict[str, int], total: int) -> bool:
     return redirect == total or (redirect > 0 and errors == 0 and success == 0 and redirect >= total * 0.9)
 
 
-def _emit_skipped(ctx: RunContext, *, hosts: list[str], reason: str, scenario_id: str, source: str) -> None:
+def _emit_skipped(
+    ctx: RunContext,
+    *,
+    hosts: list[str],
+    reason: str,
+    scenario_id: str,
+    source: str,
+    https_targets_skipped: list[str] | None = None,
+) -> None:
     from datetime import datetime, timezone
 
     ctx.event_store.append(
@@ -135,6 +153,8 @@ def _emit_skipped(ctx: RunContext, *, hosts: list[str], reason: str, scenario_id
                 "hosts": hosts,
                 "reason": reason,
                 "skipped_no_http_service": reason == "skipped_no_http_service",
+                "http_targets_not_found": reason == "HTTP_TARGETS_NOT_FOUND",
+                "https_targets_skipped": https_targets_skipped or [],
                 "requests_planned": 0,
                 "requests_sent": 0,
             },
@@ -156,6 +176,7 @@ def run(
     min_requests_per_target = int(params.get("min_requests_per_target", 100))
     abnormal_ua_ratio = float(params.get("abnormal_ua_ratio", 0.10))
     include_attack_paths = bool(params.get("include_attack_paths", True))
+    write_wire_evidence = bool(params.get("write_wire_evidence", False))
     source = "dry_run" if ctx.dry_run else "local"
     mode = "mock" if ctx.dry_run else "live"
     client = HttpClient(mode=mode, timeout=float(params.get("timeout", 10.0)))
@@ -170,13 +191,13 @@ def run(
             reason=selection.skip_reason,
             scenario_id=scenario_id,
             source=source,
+            https_targets_skipped=selection.https_targets_skipped,
         )
         return
 
     endpoints = selection.endpoints
     endpoint_tuples = [(ep.host, ep.port) for ep in endpoints]
     hosts = [ep.host for ep in endpoints]
-    https_fallback = all(ep.scheme == "https" for ep in endpoints) and bool(endpoints)
 
     per_target_budget = compute_requests_per_target(
         len(endpoint_tuples),
@@ -216,6 +237,7 @@ def run(
     timeout_count = 0
     status_counter: Counter[int] = Counter()
     request_log: list[dict[str, Any]] = []
+    wire_log: list[dict[str, Any]] = []
     t0 = time.monotonic()
 
     ctx.event_store.append(
@@ -243,7 +265,8 @@ def run(
                 "include_attack_paths": include_attack_paths,
                 "paths_planned": paths_planned,
                 "mandatory_attack_paths": list(ATTACK_SCAN_PATHS),
-                "https_fallback": https_fallback,
+                "https_fallback": False,
+                "https_targets_skipped": selection.https_targets_skipped,
                 "http_targets": targets.hosts_for_capability("http_targets"),
                 "https_targets": targets.hosts_for_capability("https_targets"),
                 "selected_http_target_reason": selection.selected_http_target_reason,
@@ -336,6 +359,16 @@ def run(
                 "outcome": result.outcome,
             }
         )
+        if write_wire_evidence:
+            from dsp.protocols.http.wire_evidence import build_wire_record_from_request
+
+            wire_log.append(
+                build_wire_record_from_request(
+                    request,
+                    response_code=response_code,
+                    target=_target_key(plan.host, plan.port),
+                )
+            )
 
         ctx.event_store.append(
             append_outcome_event(
@@ -370,6 +403,7 @@ def run(
     response_code_distribution = _response_code_distribution(status_counter)
     redirect_only_warning = _redirect_only_warning(response_code_distribution, response_count)
     request_log_path = _write_request_log(ctx, request_log)
+    wire_log_path = _write_wire_evidence_log(ctx, wire_log) if write_wire_evidence else None
     elapsed = round(time.monotonic() - t0, 3)
     ctx.event_store.append(
         build_http_followup_completed_event(
@@ -407,7 +441,8 @@ def run(
                 "requests_per_target": requests_per_target,
                 "abnormal_ua_ratio": abnormal_ua_ratio,
                 "expected_url_scan_distribution": dict(requests_per_target),
-                "https_fallback": https_fallback,
+                "https_fallback": False,
+                "https_targets_skipped": selection.https_targets_skipped,
                 "http_targets": targets.hosts_for_capability("http_targets"),
                 "https_targets": targets.hosts_for_capability("https_targets"),
                 "selected_http_target_reason": selection.selected_http_target_reason,
@@ -416,6 +451,7 @@ def run(
                 "probe_summaries": selection.probe_summaries,
                 "redirect_only_candidates": selection.redirect_only_candidates,
                 "http_followup_requests_jsonl": str(request_log_path) if request_log_path else "",
+                "http_wire_evidence_jsonl": str(wire_log_path) if wire_log_path else "",
             },
         )
     )

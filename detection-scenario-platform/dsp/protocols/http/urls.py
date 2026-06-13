@@ -7,10 +7,11 @@ from dataclasses import dataclass
 
 from dsp.protocols.base import HttpProtocolError
 
-# Plain HTTP first for sensor-visible URL/UA anomaly; HTTPS as fallback only
-HTTP_PORT_PRIORITY = (80, 8080, 8000, 8888, 9000, 9090)
+# HTTP-only detection mode — sensor-visible path/query/body/header (no TLS)
+HTTP_PORT_PRIORITY = (80, 8080, 8000, 8008, 8888, 9000)
 HTTPS_PORT_PRIORITY = (443, 8443)
-PORT_PRIORITY = HTTP_PORT_PRIORITY + HTTPS_PORT_PRIORITY
+PORT_PRIORITY = HTTP_PORT_PRIORITY
+HTTP_DETECTION_PORTS = frozenset(HTTP_PORT_PRIORITY)
 FIXED_PATHS = (
     "/",
     "/login",

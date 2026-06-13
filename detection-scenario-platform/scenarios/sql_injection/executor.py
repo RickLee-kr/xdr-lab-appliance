@@ -8,8 +8,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from dsp.engine.host_selection import probe_and_select_http_followup_endpoints
+from dsp.engine.host_selection import (
+    HttpFollowupSelection,
+    probe_and_select_http_followup_endpoints,
+)
 from dsp.engine.scenario_engine import RunContext, TargetSet
+from dsp.event_store import Event
 from dsp.protocols.http import HttpClient
 from dsp.protocols.http.sqli_events import (
     append_sqli_outcome_event,
@@ -23,20 +27,12 @@ from dsp.protocols.http.sqli_payloads import (
     plan_sqli_requests,
 )
 from dsp.protocols.http.urls import (
+    HTTP_PORT_PRIORITY,
     MAX_HOSTS_DEFAULT,
     MAX_REQUESTS_PER_HOST_DEFAULT,
     MAX_REQUESTS_TOTAL_DEFAULT,
 )
 from dsp.protocols.types import HttpRequest
-
-
-def select_sqli_hosts(targets: TargetSet, config: dict, *, max_hosts: int = MAX_HOSTS_DEFAULT) -> list[str]:
-    """Select up to max_hosts targets without discovery."""
-    if config.get("hosts"):
-        return [str(h) for h in config["hosts"]][:max_hosts]
-    if targets.hosts:
-        return list(targets.hosts)[:max_hosts]
-    return ["10.10.10.20"]
 
 
 def select_sqli_endpoints(
@@ -45,26 +41,60 @@ def select_sqli_endpoints(
     *,
     max_hosts: int,
     client: HttpClient,
-):
-    """Select 1–2 HTTP endpoints that respond, using probe scoring when available."""
+) -> HttpFollowupSelection:
+    """Select HTTP-only endpoints that respond, using probe scoring when available."""
     if config.get("hosts"):
+        from dsp.engine.host_selection import HttpFollowupEndpoint
         from dsp.protocols.http.urls import select_port_for_host
 
         hosts = [str(h) for h in config["hosts"]][:max_hosts]
-        return [(h, select_port_for_host(i)) for i, h in enumerate(hosts)], hosts
+        endpoints = [
+            HttpFollowupEndpoint(
+                host=h,
+                port=select_port_for_host(i, HTTP_PORT_PRIORITY),
+                scheme="http",
+                selection_reason="explicit_hosts",
+            )
+            for i, h in enumerate(hosts)
+        ]
+        return HttpFollowupSelection(
+            endpoints=endpoints,
+            selected_http_target_reason="explicit_hosts",
+        )
 
-    selection = probe_and_select_http_followup_endpoints(
+    return probe_and_select_http_followup_endpoints(
         targets, config, max_hosts=max_hosts, client=client
     )
-    if selection.endpoints:
-        endpoints = [(ep.host, ep.port) for ep in selection.endpoints]
-        hosts = [ep.host for ep in selection.endpoints]
-        return endpoints, hosts
 
-    hosts = select_sqli_hosts(targets, config, max_hosts=max_hosts)
-    from dsp.protocols.http.urls import select_port_for_host
 
-    return [(h, select_port_for_host(i)) for i, h in enumerate(hosts)], hosts
+def _emit_sqli_skipped(
+    ctx: RunContext,
+    *,
+    reason: str,
+    source: str,
+    https_targets_skipped: list[str] | None = None,
+) -> None:
+    from datetime import datetime, timezone
+
+    ctx.event_store.append(
+        Event(
+            run_id=ctx.run_id,
+            scenario_id="sql_injection",
+            timestamp=datetime.now(timezone.utc),
+            stage="executor",
+            event="sql_injection_skipped",
+            status="info",
+            source=source,
+            evidence={
+                "hosts": [],
+                "reason": reason,
+                "http_targets_not_found": reason == "HTTP_TARGETS_NOT_FOUND",
+                "https_targets_skipped": https_targets_skipped or [],
+                "requests_planned": 0,
+                "requests_sent": 0,
+            },
+        )
+    )
 
 
 def _run_dir_from_store(ctx: RunContext) -> Path | None:
@@ -85,14 +115,28 @@ def _write_sqli_request_log(ctx: RunContext, records: list[dict[str, Any]]) -> P
     return out_path
 
 
+def _write_sqli_wire_evidence_log(ctx: RunContext, records: list[dict[str, Any]]) -> Path | None:
+    run_dir = _run_dir_from_store(ctx)
+    if run_dir is None:
+        return None
+    from dsp.protocols.http.wire_evidence import write_wire_evidence_jsonl
+
+    out_path = run_dir / "sql_wire_evidence.jsonl"
+    return write_wire_evidence_jsonl(out_path, records)
+
+
 def _make_http_request(plan) -> HttpRequest:
     path = plan.path if not plan.query else f"{plan.path}?{plan.query}"
+    headers: dict[str, str] = {"User-Agent": "dsp-sql-injection/1.0"}
+    if plan.content_type:
+        headers["Content-Type"] = plan.content_type
     return HttpRequest(
         url=plan.url,
         method=plan.method,
         host=plan.host,
         port=plan.port,
         path=path,
+        headers=headers,
         body=plan.body,
         content_type=plan.content_type,
     )
@@ -109,13 +153,25 @@ def run(
     max_hosts = int(params.get("max_hosts", MAX_HOSTS_DEFAULT))
     max_per_host = int(params.get("max_per_host", MAX_REQUESTS_PER_HOST_DEFAULT))
     max_total = int(params.get("max_total", MAX_REQUESTS_TOTAL_DEFAULT))
+    write_wire_evidence = bool(params.get("write_wire_evidence", False))
     source = "dry_run" if ctx.dry_run else "local"
     mode = "mock" if ctx.dry_run else "live"
     client = HttpClient(mode=mode, timeout=float(params.get("timeout", 10.0)))
 
-    endpoints, hosts = select_sqli_endpoints(
+    selection = select_sqli_endpoints(
         targets, params, max_hosts=max_hosts, client=client
     )
+    if selection.skip_reason:
+        _emit_sqli_skipped(
+            ctx,
+            reason=selection.skip_reason,
+            source=source,
+            https_targets_skipped=selection.https_targets_skipped,
+        )
+        return
+
+    endpoints = [(ep.host, ep.port) for ep in selection.endpoints]
+    hosts = [ep.host for ep in selection.endpoints]
     plans = plan_sqli_requests(
         hosts,
         endpoints=endpoints,
@@ -125,12 +181,14 @@ def run(
     )
 
     ports_used = sorted({plan.port for plan in plans})
+    schemes_used = sorted({plan.url.split("://", 1)[0] for plan in plans})
     sample_urls: list[str] = []
     sample_payloads: list[str] = []
     payload_count = 0
     sent_count = 0
     response_count = 0
     request_log: list[dict[str, Any]] = []
+    wire_log: list[dict[str, Any]] = []
     category_counter: Counter[str] = Counter()
     transport_counter: Counter[str] = Counter()
     t0 = time.monotonic()
@@ -147,6 +205,8 @@ def run(
                 "planned_requests": len(plans),
                 "max_total": max_total,
                 "mode": mode,
+                "schemes_used": schemes_used,
+                "https_targets_skipped": selection.https_targets_skipped,
                 "payload_categories": sorted(SQLI_PAYLOAD_CATEGORIES),
             },
         )
@@ -220,6 +280,16 @@ def run(
                 "transport": plan.transport,
             }
         )
+        if write_wire_evidence:
+            from dsp.protocols.http.wire_evidence import build_wire_record_from_request
+
+            wire_log.append(
+                build_wire_record_from_request(
+                    request,
+                    response_code=response_code,
+                    target=f"{plan.host}:{plan.port}",
+                )
+            )
         category_counter[plan.payload_category] += 1
         transport_counter[plan.transport] += 1
 
@@ -237,6 +307,7 @@ def run(
             response_count += 1
 
     request_log_path = _write_sqli_request_log(ctx, request_log)
+    wire_log_path = _write_sqli_wire_evidence_log(ctx, wire_log) if write_wire_evidence else None
     elapsed = round(time.monotonic() - t0, 3)
     ctx.event_store.append(
         build_sql_injection_completed_event(
@@ -247,6 +318,8 @@ def run(
             evidence={
                 "targets": hosts,
                 "ports_used": ports_used,
+                "schemes_used": schemes_used,
+                "https_targets_skipped": selection.https_targets_skipped,
                 "request_count": sent_count,
                 "requests_sent": sent_count,
                 "payload_count": payload_count,
@@ -257,6 +330,7 @@ def run(
                 "payload_category_distribution": dict(category_counter),
                 "transport_distribution": dict(transport_counter),
                 "sql_injection_requests_jsonl": str(request_log_path) if request_log_path else "",
+                "sql_wire_evidence_jsonl": str(wire_log_path) if wire_log_path else "",
             },
         )
     )
