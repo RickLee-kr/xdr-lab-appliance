@@ -10,7 +10,10 @@ from typing import Any
 
 from dsp.engine.host_selection import (
     HttpFollowupSelection,
+    SKIP_REASON_HTTP_TARGETS_NOT_FOUND,
+    format_selected_target_labels,
     probe_and_select_http_followup_endpoints,
+    resolve_http_endpoint_selection,
 )
 from dsp.engine.scenario_engine import RunContext, TargetSet
 from dsp.event_store import Event
@@ -62,9 +65,39 @@ def select_sqli_endpoints(
             selected_http_target_reason="explicit_hosts",
         )
 
-    return probe_and_select_http_followup_endpoints(
+    return resolve_http_endpoint_selection(
         targets, config, max_hosts=max_hosts, client=client
     )
+
+
+def select_sqli_endpoint_targets(
+    targets: TargetSet,
+    config: dict,
+    *,
+    max_hosts: int = MAX_HOSTS_DEFAULT,
+) -> list[str]:
+    """Return host:port labels for selected SQLi HTTP endpoints."""
+    if config.get("hosts"):
+        return [str(h) for h in config["hosts"]][:max_hosts]
+    selection = resolve_http_endpoint_selection(
+        targets, config, max_hosts=max_hosts, client=None
+    )
+    if not selection.endpoints:
+        return []
+    return [f"{ep.host}:{ep.port}" for ep in selection.endpoints]
+
+
+def select_sqli_hosts(
+    targets: TargetSet,
+    config: dict,
+    *,
+    max_hosts: int = MAX_HOSTS_DEFAULT,
+) -> list[str]:
+    """Return host IPs for progress output — mirrors executor endpoint selection."""
+    return [
+        target.split(":", 1)[0]
+        for target in select_sqli_endpoint_targets(targets, config, max_hosts=max_hosts)
+    ]
 
 
 def _emit_sqli_skipped(
@@ -73,6 +106,9 @@ def _emit_sqli_skipped(
     reason: str,
     source: str,
     https_targets_skipped: list[str] | None = None,
+    probe_summaries: list[dict[str, int | str | bool]] | None = None,
+    rejected_targets: list[str] | None = None,
+    selected_targets: list[str] | None = None,
 ) -> None:
     from datetime import datetime, timezone
 
@@ -92,6 +128,10 @@ def _emit_sqli_skipped(
                 "https_targets_skipped": https_targets_skipped or [],
                 "requests_planned": 0,
                 "requests_sent": 0,
+                "probe_summaries": probe_summaries or [],
+                "target_probe": probe_summaries or [],
+                "rejected_targets": rejected_targets or [],
+                "selected_targets": selected_targets or [],
             },
         )
     )
@@ -161,17 +201,20 @@ def run(
     selection = select_sqli_endpoints(
         targets, params, max_hosts=max_hosts, client=client
     )
-    if selection.skip_reason:
+    if selection.skip_reason or not selection.endpoints:
         _emit_sqli_skipped(
             ctx,
-            reason=selection.skip_reason,
+            reason=selection.skip_reason or SKIP_REASON_HTTP_TARGETS_NOT_FOUND,
             source=source,
             https_targets_skipped=selection.https_targets_skipped,
+            probe_summaries=selection.probe_summaries,
+            rejected_targets=selection.rejected_targets,
         )
         return
 
     endpoints = [(ep.host, ep.port) for ep in selection.endpoints]
     hosts = [ep.host for ep in selection.endpoints]
+    selected_targets = format_selected_target_labels(selection.endpoints)
     plans = plan_sqli_requests(
         hosts,
         endpoints=endpoints,
@@ -201,12 +244,25 @@ def run(
             source=source,
             evidence={
                 "hosts": hosts,
-                "endpoints": [{"host": h, "port": p} for h, p in endpoints],
+                "endpoints": [
+                    {
+                        "host": ep.host,
+                        "port": ep.port,
+                        "scheme": ep.scheme,
+                        "selection_reason": ep.selection_reason,
+                    }
+                    for ep in selection.endpoints
+                ],
                 "planned_requests": len(plans),
                 "max_total": max_total,
                 "mode": mode,
                 "schemes_used": schemes_used,
                 "https_targets_skipped": selection.https_targets_skipped,
+                "selected_http_target_reason": selection.selected_http_target_reason,
+                "probe_summaries": selection.probe_summaries,
+                "target_probe": selection.probe_summaries,
+                "rejected_targets": selection.rejected_targets,
+                "selected_targets": selected_targets,
                 "payload_categories": sorted(SQLI_PAYLOAD_CATEGORIES),
             },
         )
@@ -329,6 +385,11 @@ def run(
                 "sample_payloads": sample_payloads,
                 "payload_category_distribution": dict(category_counter),
                 "transport_distribution": dict(transport_counter),
+                "selected_http_target_reason": selection.selected_http_target_reason,
+                "probe_summaries": selection.probe_summaries,
+                "target_probe": selection.probe_summaries,
+                "rejected_targets": selection.rejected_targets,
+                "selected_targets": selected_targets,
                 "sql_injection_requests_jsonl": str(request_log_path) if request_log_path else "",
                 "sql_wire_evidence_jsonl": str(wire_log_path) if wire_log_path else "",
             },

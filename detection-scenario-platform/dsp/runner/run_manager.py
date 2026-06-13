@@ -18,6 +18,7 @@ from dsp.detection.factory import (
 from dsp.detection.manager import DetectionManager
 from dsp.detection.reporting import build_detection_confirmation_entries
 from dsp.engine import RunConfig, RunContext, resolve_targets
+from dsp.engine.host_selection import cache_http_endpoint_selection
 from dsp.evidence import EvidenceExportRequest, EvidenceExporter
 from dsp.execution import ExecutionContext, create_execution_provider
 from dsp.execution.remote import RemoteEventCollectionRequest, RemoteEventCollector
@@ -218,6 +219,12 @@ class RunManager:
             dry_run=dry_run,
         )
         targets = resolve_targets(target_net, discovery=True, dry_run=dry_run)
+        cache_http_endpoint_selection(
+            config.scenario_params,
+            scenario_ids=scenario_ids,
+            targets=targets,
+            dry_run=dry_run,
+        )
 
         provider = self._create_execution_provider(
             execution_provider,

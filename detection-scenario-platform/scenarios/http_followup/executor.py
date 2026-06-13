@@ -10,7 +10,10 @@ from typing import Any
 
 from dsp.engine.host_selection import (
     HttpFollowupEndpoint,
+    SKIP_REASON_HTTP_TARGETS_NOT_FOUND,
+    format_selected_target_labels,
     probe_and_select_http_followup_endpoints,
+    resolve_http_endpoint_selection,
 )
 from dsp.engine.scenario_engine import RunContext, TargetSet
 from dsp.event_store import Event
@@ -46,9 +49,39 @@ def select_followup_endpoints(
     max_hosts: int = MAX_HOSTS_DEFAULT,
     client: HttpClient | None = None,
 ):
-    return probe_and_select_http_followup_endpoints(
+    return resolve_http_endpoint_selection(
         targets, config, max_hosts=max_hosts, client=client
     )
+
+
+def select_followup_endpoint_targets(
+    targets: TargetSet,
+    config: dict,
+    *,
+    max_hosts: int = MAX_HOSTS_DEFAULT,
+) -> list[str]:
+    """Return host:port labels for selected HTTP endpoints."""
+    if config.get("hosts"):
+        return [str(h) for h in config["hosts"]][:max_hosts]
+    selection = resolve_http_endpoint_selection(
+        targets, config, max_hosts=max_hosts, client=None
+    )
+    if not selection.endpoints:
+        return []
+    return [f"{ep.host}:{ep.port}" for ep in selection.endpoints]
+
+
+def select_followup_hosts(
+    targets: TargetSet,
+    config: dict,
+    *,
+    max_hosts: int = MAX_HOSTS_DEFAULT,
+) -> list[str]:
+    """Return host IPs for progress output — mirrors executor endpoint selection."""
+    return [
+        target.split(":", 1)[0]
+        for target in select_followup_endpoint_targets(targets, config, max_hosts=max_hosts)
+    ]
 
 
 def _target_key(host: str, port: int) -> str:
@@ -137,6 +170,9 @@ def _emit_skipped(
     scenario_id: str,
     source: str,
     https_targets_skipped: list[str] | None = None,
+    probe_summaries: list[dict[str, int | str | bool]] | None = None,
+    rejected_targets: list[str] | None = None,
+    selected_targets: list[str] | None = None,
 ) -> None:
     from datetime import datetime, timezone
 
@@ -157,6 +193,10 @@ def _emit_skipped(
                 "https_targets_skipped": https_targets_skipped or [],
                 "requests_planned": 0,
                 "requests_sent": 0,
+                "probe_summaries": probe_summaries or [],
+                "target_probe": probe_summaries or [],
+                "rejected_targets": rejected_targets or [],
+                "selected_targets": selected_targets or [],
             },
         )
     )
@@ -184,14 +224,16 @@ def run(
     selection = select_followup_endpoints(
         targets, params, max_hosts=max_hosts, client=client
     )
-    if selection.skip_reason:
+    if selection.skip_reason or not selection.endpoints:
         _emit_skipped(
             ctx,
             hosts=[],
-            reason=selection.skip_reason,
+            reason=selection.skip_reason or SKIP_REASON_HTTP_TARGETS_NOT_FOUND,
             scenario_id=scenario_id,
             source=source,
             https_targets_skipped=selection.https_targets_skipped,
+            probe_summaries=selection.probe_summaries,
+            rejected_targets=selection.rejected_targets,
         )
         return
 
@@ -218,8 +260,8 @@ def run(
         abnormal_ratio=abnormal_ua_ratio,
     )
     requests_per_target = _requests_per_target(plans)
-    selected_targets = sorted(requests_per_target)
-    concentrated_target = selected_targets[0] if len(selected_targets) == 1 else ""
+    selected_targets = format_selected_target_labels(endpoints)
+    concentrated_target = selected_targets[0].split(" ", 1)[0] if len(selected_targets) == 1 else ""
     _print_http_followup_started(
         requests_per_target=requests_per_target,
         abnormal_ua_ratio=abnormal_ua_ratio,
@@ -271,6 +313,8 @@ def run(
                 "https_targets": targets.hosts_for_capability("https_targets"),
                 "selected_http_target_reason": selection.selected_http_target_reason,
                 "probe_summaries": selection.probe_summaries,
+                "target_probe": selection.probe_summaries,
+                "rejected_targets": selection.rejected_targets,
                 "redirect_only_candidates": selection.redirect_only_candidates,
                 "selected_targets": selected_targets,
                 "concentrated_target": concentrated_target,
@@ -449,6 +493,8 @@ def run(
                 "response_code_distribution": response_code_distribution,
                 "redirect_only_warning": redirect_only_warning,
                 "probe_summaries": selection.probe_summaries,
+                "target_probe": selection.probe_summaries,
+                "rejected_targets": selection.rejected_targets,
                 "redirect_only_candidates": selection.redirect_only_candidates,
                 "http_followup_requests_jsonl": str(request_log_path) if request_log_path else "",
                 "http_wire_evidence_jsonl": str(wire_log_path) if wire_log_path else "",

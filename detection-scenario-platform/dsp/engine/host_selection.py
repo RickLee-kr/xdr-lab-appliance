@@ -26,6 +26,7 @@ class HttpFollowupSelection:
     skip_reason: str | None = None
     selected_http_target_reason: str = ""
     probe_summaries: list[dict[str, int | str]] = field(default_factory=list)
+    rejected_targets: list[str] = field(default_factory=list)
     redirect_only_candidates: list[str] = field(default_factory=list)
     https_targets_skipped: list[str] = field(default_factory=list)
 
@@ -101,6 +102,20 @@ def _https_targets_skipped_list(targets: TargetSet) -> list[str]:
     return sorted(labels)
 
 
+def _http_only_skip_selection_with_probe(
+    probed: list,
+) -> HttpFollowupSelection:
+    from dsp.protocols.http.target_probe import build_probe_debug_summaries
+
+    summaries = build_probe_debug_summaries(probed, [])
+    return HttpFollowupSelection(
+        endpoints=[],
+        skip_reason=SKIP_REASON_HTTP_TARGETS_NOT_FOUND,
+        probe_summaries=summaries,
+        rejected_targets=build_rejected_target_labels(summaries),
+    )
+
+
 def _http_only_skip_selection(targets: TargetSet) -> HttpFollowupSelection:
     """Skip when discovery has HTTPS targets but no HTTP detection endpoints."""
     return HttpFollowupSelection(
@@ -111,14 +126,140 @@ def _http_only_skip_selection(targets: TargetSet) -> HttpFollowupSelection:
 
 
 def _collect_candidate_triples(targets: TargetSet) -> list[tuple[str, int, str]]:
-    """HTTP-only candidates — allowed plain-HTTP ports only."""
-    candidates: list[tuple[str, int, str]] = []
-    http_endpoints = _filter_http_detection_endpoints(
+    """HTTP probe candidates — all allowed ports on each discovered HTTP host."""
+    http_hosts = targets.hosts_for_capability("http_targets")
+    if not http_hosts:
+        return []
+
+    discovered = _filter_http_detection_endpoints(
         _dedupe_endpoints(targets.endpoints_for_capability("http_targets"))
     )
-    for host, port in _sort_http_endpoints(http_endpoints, HTTP_PLAIN_PORTS):
-        candidates.append((host, port, "http"))
+    discovered_ports_by_host: dict[str, set[int]] = {}
+    for host, port in discovered:
+        discovered_ports_by_host.setdefault(host, set()).add(port)
+
+    rank = {port: idx for idx, port in enumerate(HTTP_PLAIN_PORTS)}
+    candidates: list[tuple[str, int, str]] = []
+    for host in sorted(http_hosts, key=lambda h: tuple(int(p) for p in h.split("."))):
+        ports_to_probe = set(HTTP_DETECTION_PORTS)
+        ports_to_probe.update(discovered_ports_by_host.get(host, set()))
+        for port in sorted(ports_to_probe, key=lambda p: (rank.get(p, len(HTTP_PLAIN_PORTS)), p)):
+            candidates.append((host, port, "http"))
     return candidates
+
+
+HTTP_ENDPOINT_SELECTION_CACHE_KEY = "_http_endpoint_selection"
+
+
+def build_rejected_target_labels(probe_summaries: list[dict[str, int | str | bool]]) -> list[str]:
+    rejected: list[str] = []
+    for row in probe_summaries:
+        if row.get("selected"):
+            continue
+        reason = str(row.get("rejection_reason") or "not_selected")
+        rejected.append(f"{row['host']}:{row['port']} ({reason})")
+    return rejected
+
+
+def selection_to_cache(selection: HttpFollowupSelection) -> dict[str, object]:
+    return {
+        "endpoints": [
+            {
+                "host": ep.host,
+                "port": ep.port,
+                "scheme": ep.scheme,
+                "selection_reason": ep.selection_reason,
+            }
+            for ep in selection.endpoints
+        ],
+        "skip_reason": selection.skip_reason,
+        "selected_http_target_reason": selection.selected_http_target_reason,
+        "probe_summaries": selection.probe_summaries,
+        "rejected_targets": selection.rejected_targets,
+        "redirect_only_candidates": selection.redirect_only_candidates,
+        "https_targets_skipped": selection.https_targets_skipped,
+    }
+
+
+def selection_from_cache(data: dict[str, object]) -> HttpFollowupSelection:
+    endpoints = [
+        HttpFollowupEndpoint(
+            host=str(item["host"]),
+            port=int(item["port"]),
+            scheme=str(item.get("scheme") or "http"),
+            selection_reason=str(item.get("selection_reason") or ""),
+        )
+        for item in data.get("endpoints", [])
+    ]
+    probe_summaries = list(data.get("probe_summaries") or [])
+    rejected_targets = list(data.get("rejected_targets") or [])
+    if not rejected_targets and probe_summaries:
+        rejected_targets = build_rejected_target_labels(probe_summaries)
+    return HttpFollowupSelection(
+        endpoints=endpoints,
+        skip_reason=data.get("skip_reason"),  # type: ignore[arg-type]
+        selected_http_target_reason=str(data.get("selected_http_target_reason") or ""),
+        probe_summaries=probe_summaries,
+        rejected_targets=rejected_targets,
+        redirect_only_candidates=list(data.get("redirect_only_candidates") or []),
+        https_targets_skipped=list(data.get("https_targets_skipped") or []),
+    )
+
+
+def resolve_http_endpoint_selection(
+    targets: TargetSet,
+    config: dict,
+    *,
+    max_hosts: int,
+    client=None,
+) -> HttpFollowupSelection:
+    """Return cached or freshly probed HTTP endpoint selection for URL scan / SQLi."""
+    cached = config.get(HTTP_ENDPOINT_SELECTION_CACHE_KEY)
+    if cached:
+        return selection_from_cache(cached)
+    return probe_and_select_http_followup_endpoints(
+        targets,
+        config,
+        max_hosts=max_hosts,
+        client=client,
+    )
+
+
+def cache_http_endpoint_selection(
+    scenario_params: dict[str, dict[str, object]],
+    *,
+    scenario_ids: list[str],
+    targets: TargetSet,
+    dry_run: bool,
+) -> None:
+    """Probe once and share endpoint selection across HTTP detection scenarios."""
+    http_scenarios = [sid for sid in scenario_ids if sid in ("http_followup", "sql_injection")]
+    if not http_scenarios:
+        return
+
+    from dsp.protocols.http.client import HttpClient
+
+    ref_params = scenario_params.get(http_scenarios[0], {})
+    max_hosts = max(
+        int(scenario_params.get(sid, {}).get("max_hosts", 2))
+        for sid in http_scenarios
+    )
+    timeout = float(ref_params.get("timeout", 10.0))
+    client = HttpClient(mode="mock" if dry_run else "live", timeout=timeout)
+    selection = probe_and_select_http_followup_endpoints(
+        targets,
+        ref_params,
+        max_hosts=max_hosts,
+        client=client,
+    )
+    cache = selection_to_cache(selection)
+    for sid in http_scenarios:
+        scenario_params.setdefault(sid, {})[HTTP_ENDPOINT_SELECTION_CACHE_KEY] = cache
+
+
+def format_selected_target_labels(endpoints: list[HttpFollowupEndpoint]) -> list[str]:
+    """Format selected targets with probe-based selection reason."""
+    return [f"{ep.host}:{ep.port} ({ep.selection_reason})" for ep in endpoints]
 
 
 def select_http_followup_endpoints(
@@ -172,49 +313,45 @@ def probe_and_select_http_followup_endpoints(
         return HttpFollowupSelection(endpoints=[], skip_reason="skipped_no_http_service")
 
     if client is None:
-        return _select_without_probe(candidates, max_hosts=max_hosts, targets=targets)
+        from dsp.protocols.http.client import HttpClient
+
+        client = HttpClient(mode="mock")
 
     from dsp.protocols.http.target_probe import (
-        HttpEndpointProbeStats,
-        is_eligible_url_scan_target,
-        rank_probe_candidates,
+        build_probe_debug_summaries,
+        pick_best_endpoint_per_host,
+        probe_all_http_candidates,
+        probe_quality_sort_key,
         selection_reason_for,
     )
 
-    max_probe = int(config.get("max_probe_candidates", 8))
-    ranked = rank_probe_candidates(candidates, client=client, max_probe=max_probe)
-    if not ranked:
+    probed = probe_all_http_candidates(candidates, client=client)
+    if not probed:
         if _https_targets_skipped_list(targets):
             return _http_only_skip_selection(targets)
         return HttpFollowupSelection(endpoints=[], skip_reason="skipped_no_http_service")
 
-    eligible = [(stats, score) for stats, score in ranked if is_eligible_url_scan_target(stats)]
-    non_redirect = [(stats, score) for stats, score in eligible if not stats.is_redirect_only]
-    redirect_only = [(stats, score) for stats, score in eligible if stats.is_redirect_only]
-    ordered = non_redirect + redirect_only
-    if not ordered:
-        # Fall back to any non-redirect probe result when no 400/404 candidates exist.
-        fallback = [(stats, score) for stats, score in ranked if not stats.is_redirect_only]
-        ordered = fallback + [(stats, score) for stats, score in ranked if stats.is_redirect_only]
+    best_per_host = pick_best_endpoint_per_host(probed)
+    if not best_per_host:
+        skip_reason = (
+            SKIP_REASON_HTTP_TARGETS_NOT_FOUND
+            if targets.hosts_for_capability("http_targets")
+            else "skipped_no_http_service"
+        )
+        if skip_reason == SKIP_REASON_HTTP_TARGETS_NOT_FOUND:
+            return _http_only_skip_selection_with_probe(probed)
+        return HttpFollowupSelection(
+            endpoints=[],
+            skip_reason=skip_reason,
+            probe_summaries=build_probe_debug_summaries(probed, []),
+            rejected_targets=build_rejected_target_labels(build_probe_debug_summaries(probed, [])),
+        )
+
+    hosts_ranked = sorted(best_per_host.values(), key=probe_quality_sort_key)
 
     selected: list[HttpFollowupEndpoint] = []
-    probe_summaries: list[dict[str, int | str]] = []
-    redirect_labels: list[str] = []
-    selected_keys: set[tuple[str, int]] = set()
-    selected_hosts: set[str] = set()
-
-    for stats, _score in ordered:
-        probe_summaries.append(stats.to_summary())
-        label = f"{stats.scheme}://{stats.host}:{stats.port}"
-        if stats.is_redirect_only:
-            redirect_labels.append(label)
-
-    def _append_endpoint(stats: HttpEndpointProbeStats) -> None:
-        key = (stats.host, stats.port)
-        if key in selected_keys or len(selected) >= max_hosts:
-            return
-        selected_keys.add(key)
-        selected_hosts.add(stats.host)
+    if max_hosts == 1:
+        stats = hosts_ranked[0]
         selected.append(
             HttpFollowupEndpoint(
                 host=stats.host,
@@ -223,82 +360,47 @@ def probe_and_select_http_followup_endpoints(
                 selection_reason=selection_reason_for(stats),
             )
         )
-
-    if max_hosts == 1:
-        # URL scan concentration — single best probe-scored target (400/404 preferred).
-        for stats, _score in ordered:
-            _append_endpoint(stats)
-            break
     else:
-        # Top N probe-scored targets — prefer one endpoint per unique host.
-        for stats, _score in ordered:
-            if stats.host in selected_hosts:
-                continue
-            _append_endpoint(stats)
+        for stats in hosts_ranked[:max_hosts]:
+            selected.append(
+                HttpFollowupEndpoint(
+                    host=stats.host,
+                    port=stats.port,
+                    scheme=stats.scheme,
+                    selection_reason=selection_reason_for(stats),
+                )
+            )
 
-        for stats, _score in ordered:
-            _append_endpoint(stats)
+    selected_keys = [(ep.host, ep.port) for ep in selected]
+    probe_summaries = build_probe_debug_summaries(probed, selected_keys)
+    rejected_targets = build_rejected_target_labels(probe_summaries)
+    redirect_labels = [
+        f"{stats.scheme}://{stats.host}:{stats.port}"
+        for stats in probed
+        if stats.is_redirect_only
+    ]
 
     primary_reason = selected[0].selection_reason if selected else ""
-    if primary_reason == "redirect_only_low_priority":
-        primary_reason = "redirect_only_low_priority"
-    elif primary_reason in ("error_responses_available", "not_redirect_only"):
-        primary_reason = primary_reason
+
+    if not selected:
+        skip_reason = (
+            SKIP_REASON_HTTP_TARGETS_NOT_FOUND
+            if targets.hosts_for_capability("http_targets")
+            else "skipped_no_http_service"
+        )
+        return HttpFollowupSelection(
+            endpoints=[],
+            skip_reason=skip_reason,
+            probe_summaries=probe_summaries,
+            rejected_targets=rejected_targets,
+            redirect_only_candidates=redirect_labels,
+            https_targets_skipped=_https_targets_skipped_list(targets),
+        )
 
     return HttpFollowupSelection(
         endpoints=selected,
         selected_http_target_reason=primary_reason,
         probe_summaries=probe_summaries,
+        rejected_targets=rejected_targets,
         redirect_only_candidates=redirect_labels,
     )
-
-
-def _pick_diverse_endpoints(
-    endpoints: list[tuple[str, int, str]],
-    *,
-    max_hosts: int,
-) -> list[tuple[str, int, str]]:
-    """Pick up to max_hosts endpoints, preferring unique hosts first."""
-    picked: list[tuple[str, int, str]] = []
-    seen_keys: set[tuple[str, int]] = set()
-    seen_hosts: set[str] = set()
-
-    def _append(ep: tuple[str, int, str]) -> None:
-        host, port, _scheme = ep
-        key = (host, port)
-        if key in seen_keys or len(picked) >= max_hosts:
-            return
-        seen_keys.add(key)
-        seen_hosts.add(host)
-        picked.append(ep)
-
-    for ep in endpoints:
-        if ep[0] not in seen_hosts:
-            _append(ep)
-    for ep in endpoints:
-        _append(ep)
-    return picked
-
-
-def _select_without_probe(
-    candidates: list[tuple[str, int, str]],
-    *,
-    max_hosts: int,
-    targets: TargetSet | None = None,
-) -> HttpFollowupSelection:
-    """Fallback when no probe client — HTTP port-priority only."""
-    http_eps = [(h, p, s) for h, p, s in candidates if s == "http"]
-    if http_eps:
-        picked = _pick_diverse_endpoints(http_eps, max_hosts=max_hosts)
-        return HttpFollowupSelection(
-            endpoints=[
-                HttpFollowupEndpoint(host=h, port=p, scheme=s, selection_reason="not_redirect_only")
-                for h, p, s in picked
-            ],
-            selected_http_target_reason="not_redirect_only",
-        )
-
-    if targets is not None and _https_targets_skipped_list(targets):
-        return _http_only_skip_selection(targets)
-
-    return HttpFollowupSelection(endpoints=[], skip_reason="skipped_no_http_service")

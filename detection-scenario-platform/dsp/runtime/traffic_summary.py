@@ -103,7 +103,7 @@ def build_traffic_summary(
             })
         elif sid == "http_followup":
             scenario_summary.update({
-                "requests_planned": started.get("planned_requests", 0),
+                "requests_planned": 0 if skipped else started.get("planned_requests", 0),
                 "requests_sent": completed.get("request_count") or _count_events(events, sid, "http_request_sent"),
                 "responses_received": completed.get("response_count", 0),
                 "paths_sample": completed.get("paths_used") or started.get("paths_planned"),
@@ -126,14 +126,26 @@ def build_traffic_summary(
                 "selected_http_target_reason": completed.get("selected_http_target_reason")
                 or started.get("selected_http_target_reason", ""),
                 "redirect_only_warning": completed.get("redirect_only_warning", False),
-                "probe_summaries": completed.get("probe_summaries") or started.get("probe_summaries", []),
+                "probe_summaries": completed.get("probe_summaries")
+                or started.get("probe_summaries")
+                or skipped.get("probe_summaries", []),
+                "target_probe": completed.get("target_probe")
+                or started.get("target_probe")
+                or skipped.get("target_probe")
+                or completed.get("probe_summaries")
+                or started.get("probe_summaries")
+                or skipped.get("probe_summaries", []),
+                "rejected_targets": completed.get("rejected_targets")
+                or started.get("rejected_targets")
+                or skipped.get("rejected_targets", []),
                 "redirect_only_candidates": completed.get("redirect_only_candidates")
                 or started.get("redirect_only_candidates", []),
                 "target_count": completed.get("target_count", len(completed.get("target_distribution", {}))),
                 "concentrated_target": completed.get("concentrated_target", ""),
                 "target_distribution": completed.get("target_distribution", {}),
                 "selected_targets": completed.get("selected_targets")
-                or started.get("selected_targets", []),
+                or started.get("selected_targets", [])
+                or skipped.get("selected_targets", []),
                 "requests_per_target": completed.get("requests_per_target")
                 or started.get("requests_per_target", {}),
                 "per_target_request_count": completed.get("per_target_request_count", {}),
@@ -167,7 +179,7 @@ def build_traffic_summary(
             })
         elif sid == "sql_injection":
             scenario_summary.update({
-                "requests_planned": started.get("planned_requests", 0),
+                "requests_planned": 0 if skipped else started.get("planned_requests", 0),
                 "requests_sent": completed.get("requests_sent") or completed.get("request_count", 0),
                 "responses_received": completed.get("response_count", 0),
                 "payload_count": completed.get("payload_count", 0),
@@ -181,6 +193,23 @@ def build_traffic_summary(
                 "http_targets_not_found": skipped.get("http_targets_not_found", False)
                 or skipped.get("reason") == "HTTP_TARGETS_NOT_FOUND",
                 "duration_sec": completed.get("duration_sec"),
+                "selected_http_target_reason": completed.get("selected_http_target_reason")
+                or started.get("selected_http_target_reason", ""),
+                "probe_summaries": completed.get("probe_summaries")
+                or started.get("probe_summaries")
+                or skipped.get("probe_summaries", []),
+                "target_probe": completed.get("target_probe")
+                or started.get("target_probe")
+                or skipped.get("target_probe")
+                or completed.get("probe_summaries")
+                or started.get("probe_summaries")
+                or skipped.get("probe_summaries", []),
+                "rejected_targets": completed.get("rejected_targets")
+                or started.get("rejected_targets")
+                or skipped.get("rejected_targets", []),
+                "selected_targets": completed.get("selected_targets")
+                or started.get("selected_targets", [])
+                or skipped.get("selected_targets", []),
                 "sql_injection_requests_jsonl": completed.get("sql_injection_requests_jsonl", ""),
             })
 
