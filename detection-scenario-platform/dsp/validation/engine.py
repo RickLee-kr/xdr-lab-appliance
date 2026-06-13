@@ -11,6 +11,14 @@ from dsp.event_store import EventStore, EventQuery, MetricDef, ValidationDecisio
 from dsp.plugins.models import Manifest, PluginRecord
 from dsp.plugins.registry import PluginRegistry
 
+_SCENARIO_SKIP_EVENTS = frozenset({
+    "scenario_skipped",
+    "smb_scenario_skipped",
+    "http_followup_skipped",
+    "sql_injection_skipped",
+    "ssh_failure_skipped",
+})
+
 
 class ValidationEngine:
     """Generic validation_profile applicator — no per-scenario branches."""
@@ -61,7 +69,7 @@ class ValidationEngine:
         profile_version = str(vp.get("profile_version", "1.0.0"))
         metric_defs = _parse_metrics(vp.get("metrics", []))
 
-        skipped = self._has_event(run_id, scenario_id, "scenario_skipped")
+        skipped = self._is_scenario_skipped(run_id, scenario_id)
         if skipped:
             return ValidationResult(
                 run_id=run_id,
@@ -107,6 +115,15 @@ class ValidationEngine:
             )
             > 0
         )
+
+    def _is_scenario_skipped(self, run_id: str, scenario_id: str) -> bool:
+        for event_name in _SCENARIO_SKIP_EVENTS:
+            if self._has_event(run_id, scenario_id, event_name):
+                return True
+        for event_name in (f"{scenario_id}_skipped",):
+            if self._has_event(run_id, scenario_id, event_name):
+                return True
+        return False
 
     def _evaluate_fail_fast(
         self,

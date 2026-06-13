@@ -18,7 +18,11 @@ from dsp.detection.factory import (
 from dsp.detection.manager import DetectionManager
 from dsp.detection.reporting import build_detection_confirmation_entries
 from dsp.engine import RunConfig, RunContext, resolve_targets
-from dsp.engine.host_selection import cache_http_endpoint_selection
+from dsp.engine.host_selection import (
+    cache_http_endpoint_selection,
+    http_target_probe_payload,
+    print_http_endpoint_probe_diagnostics,
+)
 from dsp.evidence import EvidenceExportRequest, EvidenceExporter
 from dsp.execution import ExecutionContext, create_execution_provider
 from dsp.execution.remote import RemoteEventCollectionRequest, RemoteEventCollector
@@ -225,6 +229,22 @@ class RunManager:
             targets=targets,
             dry_run=dry_run,
         )
+        http_probe_selection = print_http_endpoint_probe_diagnostics(
+            config.scenario_params,
+            scenario_ids,
+            discovered_http_hosts=targets.hosts_for_capability("http_targets"),
+        )
+        if http_probe_selection is not None:
+            (run_dir / "http_target_probe.json").write_text(
+                json.dumps(
+                    http_target_probe_payload(
+                        http_probe_selection,
+                        discovered_http_hosts=targets.hosts_for_capability("http_targets"),
+                    ),
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
 
         provider = self._create_execution_provider(
             execution_provider,

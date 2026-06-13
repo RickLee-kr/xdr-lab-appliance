@@ -215,4 +215,15 @@ def build_traffic_summary(
 
         summary["scenarios"][sid] = scenario_summary
 
+    for sid in ("http_followup", "sql_injection"):
+        scenario_probe = summary["scenarios"].get(sid, {})
+        target_probe = scenario_probe.get("target_probe")
+        if target_probe:
+            summary["target_probe"] = target_probe
+            summary["selected_targets"] = scenario_probe.get("selected_targets", [])
+            summary["rejected_targets"] = scenario_probe.get("rejected_targets", [])
+            if scenario_probe.get("skip_reason"):
+                summary["http_endpoint_skip_reason"] = scenario_probe["skip_reason"]
+            break
+
     return summary
